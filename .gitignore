@@ -1,0 +1,6 @@
+.venv/
+wandb/
+main.py
+__pycache__
+
+**/*.pt
