@@ -571,7 +571,7 @@ class CustomCausalAttention(nn.Module):
                 q_prime, k_prime, v, is_causal=True, scale=scale
             )
 
-        elif self.attention_type == "rbf":
+        elif self.attention_type == "rbf_triton":
             # OPTION 2: The Fully Derived Custom Triton Implementation
             out = TritonScaledRBFAttention.apply(q, k, v, True)
 

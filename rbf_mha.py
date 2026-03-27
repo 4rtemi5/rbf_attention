@@ -33,7 +33,7 @@ class TrainingConfig:
     # Training params
     epochs: int = 1
     eval_steps: int = 500  # Evaluate every N steps
-    learning_rate: float = 6e-3
+    learning_rate: float = 4e-3
     use_amp: bool = torch.cuda.is_available()
 
     # Generation params
@@ -422,7 +422,7 @@ std_model_fast, std_train_loss, std_val_loss, std_train_steps, std_val_steps = (
 
 rbf_model_fast, rbf_train_loss, rbf_val_loss, rbf_train_steps, rbf_val_steps = (
     train_variant(
-        "rbf_math",
+        "rbf_triton",
         train_loader,
         val_loader,
         vocab_size,
