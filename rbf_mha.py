@@ -6,7 +6,6 @@ from dataclasses import asdict, dataclass
 import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from datasets import load_dataset
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
@@ -34,7 +33,7 @@ class TrainingConfig:
     # Training params
     epochs: int = 1
     eval_steps: int = 500  # Evaluate every N steps
-    learning_rate: float = 1e-3
+    learning_rate: float = 6e-3
     use_amp: bool = torch.cuda.is_available()
 
     # Generation params
@@ -187,7 +186,7 @@ def train_variant(
         torch.set_float32_matmul_precision("high")
         model = torch.compile(model)
 
-    criterion = torch.nn.CrossEntropyLoss(ignore_index=pad_token_id)
+    criterion = torch.nn.CrossEntropyLoss(ignore_index=-100)
 
     optimizer = AdamW(model.parameters(), lr=config.learning_rate)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -219,8 +218,12 @@ def train_variant(
 
                 for batch_idx, batch in enumerate(train_loader):
                     input_ids = batch["input_ids"].to(config.device)
+                    attention_mask = batch["attention_mask"].to(config.device)
+
                     x = input_ids[:, :-1]
-                    y = input_ids[:, 1:]
+                    y = input_ids[:, 1:].clone()
+                    mask = attention_mask[:, 1:]
+                    y[mask == 0] = -100
 
                     optimizer.zero_grad()
                     with oom_detection(config.device):
@@ -273,14 +276,19 @@ def train_variant(
                         with torch.no_grad():
                             for val_batch in val_loader:
                                 val_input_ids = val_batch["input_ids"].to(config.device)
+                                val_attention_mask = val_batch["attention_mask"].to(
+                                    config.device
+                                )
+
                                 val_x = val_input_ids[:, :-1]
-                                val_y = val_input_ids[:, 1:]
+                                val_y = val_input_ids[:, 1:].clone()
+                                val_mask = val_attention_mask[:, 1:]
+                                val_y[val_mask == 0] = -100
 
                                 val_logits, _ = model(val_x)
-                                val_loss = F.cross_entropy(
+                                val_loss = criterion(
                                     val_logits.reshape(-1, vocab_size),
                                     val_y.reshape(-1),
-                                    ignore_index=pad_token_id,
                                 )
                                 total_val_loss += val_loss.item()
 
