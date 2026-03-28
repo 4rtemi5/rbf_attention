@@ -55,6 +55,24 @@ Thanks to the Triton implementation, the memory footprint stays low, and the for
 ![Profiling Results](outputs/attention_profiling_results.png)
 
 
+## Installation and Usage
+
+```bash
+# install dependencies
+pip install -r requirements.txt
+
+# check kernel equivalence
+python test_equivalence.py
+python rbf_math_test.py
+
+# benchmark attention implementations
+python profile_attention.py
+
+# train and compare models using rbf/standard attention
+python train_rbf_transformer.py
+```
+
+
 ## ⚠️ Caveats & Future Work
 
 While these results are a really fun proof-of-concept, I want to be upfront about the limitations:
