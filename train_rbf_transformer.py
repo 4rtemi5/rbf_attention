@@ -538,14 +538,14 @@ if config.train_rbf and config.train_standard:
     plt.plot(
         rbf_train_steps,
         rbf_train_loss,
-        label="New&Fun Train Loss",
+        label="RBF Train Loss",
         color="orange",
         linestyle="-",
     )
     plt.plot(
         rbf_val_steps,
         rbf_val_loss,
-        label="New&Fun Val Loss",
+        label="RBF Val Loss",
         color="orange",
         linestyle="--",
     )
