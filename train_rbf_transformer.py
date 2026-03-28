@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
 import wandb
-from triton_rbf_attention import CustomCausalAttention
+from rbf_attention import CustomCausalAttention
 
 
 @dataclass

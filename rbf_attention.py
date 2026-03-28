@@ -502,7 +502,6 @@ def _rbf_attn_bwd_dq_kernel(
             other=0.0,
         )
 
-        # [CONSISTENCY UPDATE]
         k_f32 = k.to(tl.float32)
         k_sq = tl.sum(k_f32 * k_f32, axis=1)
         k_sq_f16 = k_sq.to(K.dtype.element_ty).to(tl.float32)
@@ -753,7 +752,7 @@ def _rbf_non_softmax_fwd_kernel(
         q_ptrs, mask=(offs_m[:, None] < N_CTX) & (offs_d[None, :] < D_HEAD), other=0.0
     )
 
-    # PRE-COMPUTE scaled Q norm (Fixes numerical instability while preserving performance)
+    # PRE-COMPUTE scaled Q norm to fixe numerical instability while preserving performance
     q_f32 = q.to(tl.float32)
     q_sq_scaled = tl.sum(q_f32 * q_f32, axis=1) * sm_scale
     sm_scale_x2 = 2.0 * sm_scale
@@ -763,7 +762,7 @@ def _rbf_non_softmax_fwd_kernel(
     lo = 0
     hi = tl.minimum(N_CTX, (start_m + 1) * BLOCK_M) if IS_CAUSAL else N_CTX
 
-    # [OPTIMIZATION] Set pointer bases cleanly outside the loop
+    # Set pointer bases cleanly outside the loop
     k_ptrs = (
         K
         + off_z * stride_kz
@@ -783,7 +782,7 @@ def _rbf_non_softmax_fwd_kernel(
         start_n_idx = tl.multiple_of(start_n, BLOCK_N)
         curr_offs_n = start_n_idx + offs_n
 
-        # [OPTIMIZATION] Fast 1D scalar pointer advancements
+        # Fast 1D scalar pointer advancements
         k = tl.load(
             k_ptrs + start_n_idx * stride_kn,
             mask=(curr_offs_n[:, None] < N_CTX) & (offs_d[None, :] < D_HEAD),
@@ -802,7 +801,7 @@ def _rbf_non_softmax_fwd_kernel(
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         qk += tl.dot(q, tl.trans(k))
 
-        # Fused Logits (Inherently bounds <= 0, perfectly protecting against exp() fp32 overflow limits)
+        # Fused Logits (Inherently bounds <= 0, protecting against exp() fp32 overflow limits)
         logits = qk * sm_scale_x2 - q_sq_scaled[:, None] - k_sq_scaled[None, :]
 
         if IS_CAUSAL and start_m * BLOCK_M < start_n_idx + BLOCK_N:
@@ -896,14 +895,14 @@ def _rbf_non_softmax_bwd_dk_dv_kernel(
     k_sq_scaled = tl.sum(k_f32 * k_f32, axis=1) * sm_scale
     sm_scale_x2 = 2.0 * sm_scale
 
-    # [OPTIMIZATION] Setup pure accumulators completely outside the loop
+    # Setup pure accumulators completely outside the loop
     dk_dot = tl.zeros([BLOCK_N, BLOCK_DMODEL], dtype=tl.float32)
     S_colsum_acc = tl.zeros([BLOCK_N], dtype=tl.float32)
     dv = tl.zeros([BLOCK_N, BLOCK_DMODEL], dtype=tl.float32)
 
     lo = (start_n_idx // BLOCK_M) * BLOCK_M if IS_CAUSAL else 0
 
-    # [OPTIMIZATION] Set pointer bases cleanly outside the loop
+    # Set pointer bases cleanly outside the loop
     q_ptrs = (
         Q
         + off_z * stride_qz
@@ -963,11 +962,11 @@ def _rbf_non_softmax_bwd_dk_dv_kernel(
 
         S = (p * dp * (-sm_scale_x2)).to(tl.float32)
 
-        # [OPTIMIZATION] Strict pure tensor core accumulation inside loop
+        # Tensor core accumulation inside loop
         S_colsum_acc += tl.sum(S, axis=0)
         dk_dot += tl.dot(tl.trans(S).to(Q.dtype.element_ty), q)
 
-    # [OPTIMIZATION] Apply mathematical hoist ONCE outside loop
+    # Apply mathematical hoist ONCE
     dk = S_colsum_acc[:, None] * k_f32 - dk_dot
 
     dk_ptrs = (
@@ -1066,13 +1065,13 @@ def _rbf_non_softmax_bwd_dq_kernel(
     q_sq_scaled = tl.sum(q_f32 * q_f32, axis=1) * sm_scale
     sm_scale_x2 = 2.0 * sm_scale
 
-    # [OPTIMIZATION] Setup pure accumulators completely outside the loop
+    # Pure accumulators completely outside the loop
     dq_dot = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
     S_rowsum_acc = tl.zeros([BLOCK_M], dtype=tl.float32)
 
     hi = tl.minimum(N_CTX, start_m_idx + BLOCK_M) if IS_CAUSAL else N_CTX
 
-    # [OPTIMIZATION] Set pointer bases cleanly outside the loop
+    # Set pointer bases outside the loop
     k_ptrs = (
         K
         + off_z * stride_kz
@@ -1111,7 +1110,7 @@ def _rbf_non_softmax_bwd_dq_kernel(
 
         logits = qk * sm_scale_x2 - q_sq_scaled[:, None] - k_sq_scaled[None, :]
 
-        # [OPTIMIZATION] Boundary tracking directly mirrored from dK_dV logic.
+        # Boundary tracking directly mirrored from dK_dV logic.
         if IS_CAUSAL and start_m_idx < start_n_idx + BLOCK_N:
             logits = tl.where(
                 offs_m[:, None] >= curr_offs_n[None, :], logits, float("-inf")
@@ -1130,11 +1129,11 @@ def _rbf_non_softmax_bwd_dq_kernel(
 
         S = (p * dp * (-sm_scale_x2)).to(tl.float32)
 
-        # [OPTIMIZATION] Strict pure tensor core accumulation inside loop
+        # Pure tensor core accumulation inside loop
         S_rowsum_acc += tl.sum(S, axis=1)
         dq_dot += tl.dot(S.to(K.dtype.element_ty), k)
 
-    # [OPTIMIZATION] Apply mathematical hoist ONCE outside loop
+    # Apply mathematical hoist outside the loop
     dq = S_rowsum_acc[:, None] * q_f32 - dq_dot
 
     dq_ptrs = (
@@ -1276,6 +1275,18 @@ def compute_rbf_logits(q, k):
 
 class CustomCausalAttention(nn.Module):
     def __init__(self, num_heads, emb_dims, attention_type="standard"):
+        assert (
+            attention_type
+            in [
+                "standard",  # Standard Attention using F.scaled_dot_product_attention
+                "standard_slow",  # Explicit baseline implementation of Attention
+                "rbf_math",  # Mathematical equivalent of rbf-attention using F.scaled_dot_product_attention
+                "rbf",  # Triton Implementation of RBF-Attention
+                "rbf_slow",  # Baseline implementation of RBF-Attention
+                "rbf_non_softmax_slow",  # Non-Softmax RBF-Attention
+                "rbf_non_softmax",  # Triton Implementation of Non-Softmax RBF-Attention
+            ]
+        ), f"Unknown attention type: {attention_type}"
         super().__init__()
         self.num_heads = num_heads
         self.attention_type = attention_type
@@ -1291,9 +1302,11 @@ class CustomCausalAttention(nn.Module):
         attn_weights = None
 
         if self.attention_type == "standard":
+            # Standard Attention using F.scaled_dot_product_attention
             out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
         elif self.attention_type == "standard_slow":
+            # Explicit baseline implementation of Attention
             attn_logits = q @ k.transpose(-2, -1)
             attn_logits = attn_logits / (q.size(-1) ** 0.5)
             causal_mask = torch.triu(
@@ -1304,6 +1317,7 @@ class CustomCausalAttention(nn.Module):
             out = attn_weights @ v
 
         elif self.attention_type == "rbf_math":
+            # Mathematical equivalent of rbf-attention using F.scaled_dot_product_attention
             # Softmax shift-invariance natively cancels out ||q||^2 completely.
 
             k_sq = k.float().pow(2).sum(dim=-1, keepdim=True).to(k.dtype)
@@ -1324,11 +1338,11 @@ class CustomCausalAttention(nn.Module):
             )
 
         elif self.attention_type == "rbf":
-            # OPTION 2: The Fully Derived Custom Triton Implementation
+            # Triton Implementation of RBF-Attention
             out = TritonScaledRBFAttention.apply(q, k, v, True)
 
         elif self.attention_type == "rbf_slow":
-            # Baseline explicitly materialized code
+            # Baseline implementation of RBF-Attention
             attn_logits = compute_rbf_logits(q, k)
             causal_mask = torch.triu(
                 torch.ones(s, s, device=x.device), diagonal=1
@@ -1347,6 +1361,7 @@ class CustomCausalAttention(nn.Module):
             attn_weights = torch.exp(attn_logits)
             out = attn_weights @ v
         elif self.attention_type == "rbf_non_softmax":
+            # Triton Implementation of Non-Softmax RBF-Attention
             out = TritonNonSoftmaxRBFAttention.apply(q, k, v, True)
         else:
             raise ValueError(f"Unknown attention type: {self.attention_type}")

@@ -3,7 +3,7 @@ import math
 import torch
 import torch.nn.functional as F
 
-from triton_rbf_attention import TritonScaledRBFAttention
+from rbf_attention import TritonScaledRBFAttention
 
 
 def rbf_math_forward(q, k, v):

@@ -5,8 +5,7 @@ import torch
 import torch.nn.functional as F
 import triton
 
-from triton_rbf_attention import (
-    TritonNonSoftmaxRBFAttention,
+from rbf_attention import (
     TritonScaledRBFAttention,
 )
 
@@ -80,8 +79,8 @@ def run_benchmarks():
         "SDPA Baseline": {"fwd": [], "bwd": [], "mem": []},
         "RBF Math": {"fwd": [], "bwd": [], "mem": []},
         "RBF Triton": {"fwd": [], "bwd": [], "mem": []},
-        "Non-Softmax Math": {"fwd": [], "bwd": [], "mem": []},
-        "Non-Softmax Triton": {"fwd": [], "bwd": [], "mem": []},
+        # "Non-Softmax Math": {"fwd": [], "bwd": [], "mem": []},
+        # "Non-Softmax Triton": {"fwd": [], "bwd": [], "mem": []},
     }
 
     for seq_len in SEQ_LENS:
@@ -122,11 +121,11 @@ def run_benchmarks():
             ),
             ("RBF Math", lambda: rbf_math_forward(q, k, v)),
             ("RBF Triton", lambda: TritonScaledRBFAttention.apply(q, k, v, True)),
-            ("Non-Softmax Math", lambda: rbf_non_softmax_math_forward(q, k, v)),
-            (
-                "Non-Softmax Triton",
-                lambda: TritonNonSoftmaxRBFAttention.apply(q, k, v, True),
-            ),
+            # ("Non-Softmax Math", lambda: rbf_non_softmax_math_forward(q, k, v)),
+            # (
+            #     "Non-Softmax Triton",
+            #     lambda: TritonNonSoftmaxRBFAttention.apply(q, k, v, True),
+            # ),
         ]
 
         for name, fn in methods:
