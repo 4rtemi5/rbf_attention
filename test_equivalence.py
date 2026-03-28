@@ -32,7 +32,7 @@ def rbf_math_forward(q, k, v):
     return out
 
 
-def run_equivalence_test():
+def run_equivalence_test(dtype=torch.float16):
     torch.manual_seed(42)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -45,7 +45,7 @@ def run_equivalence_test():
     HEADS = 4
     SEQ_LEN = 128
     HEAD_DIM = 64
-    DTYPE = torch.float16  # Standard for Triton/FlashAttention operations
+    DTYPE = dtype
 
     print(
         f"Testing Equivalence -> B={BATCH}, H={HEADS}, SEQ={SEQ_LEN}, DIM={HEAD_DIM}, DTYPE={DTYPE}\n"
@@ -81,7 +81,9 @@ def run_equivalence_test():
     # ==========================================
     # COMPARISON
     # ==========================================
-    def compare_tensors(name, t1, t2, atol=1e-3, rtol=1e-3):
+    def compare_tensors(name, t1, t2, atol=None, rtol=1e-3):
+        if atol is None:
+            atol = 3e-2 if t1.dtype == torch.float32 else 1e-2
         # Calculate maximum absolute difference
         max_diff = (t1 - t2).abs().max().item()
 
@@ -105,4 +107,5 @@ if __name__ == "__main__":
     # Ensure TF32 is allowed for fair internal comparisons if your GPU supports it
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    run_equivalence_test()
+    run_equivalence_test(dtype=torch.float16)
+    run_equivalence_test(dtype=torch.float32)

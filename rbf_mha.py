@@ -32,9 +32,16 @@ class TrainingConfig:
 
     # Training params
     epochs: int = 1
+    log_steps: int = 100
     eval_steps: int = 500  # Evaluate every N steps
-    learning_rate: float = 4e-3
+    learning_rate: float = 3e-3
+    warmup_steps: int = 1000
     use_amp: bool = torch.cuda.is_available()
+    standard_training_attention: str = "standard"
+    rbf_training_attention: str = "rbf"
+
+    standard_eval_attention: str = "standard_slow"
+    rbf_eval_attention: str = "rbf_slow"
 
     # Generation params
     prompt: str = "Once upon a time, a little boy named Tim"
@@ -189,8 +196,20 @@ def train_variant(
     criterion = torch.nn.CrossEntropyLoss(ignore_index=-100)
 
     optimizer = AdamW(model.parameters(), lr=config.learning_rate)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=config.epochs * len(train_loader)
+
+    total_steps = config.epochs * len(train_loader)
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=total_steps - config.warmup_steps,
+        eta_min=1e-5,
+    )
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=1e-5, total_iters=config.warmup_steps
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[config.warmup_steps],
     )
     scaler = torch.amp.GradScaler(enabled=config.use_amp)
 
@@ -208,7 +227,7 @@ def train_variant(
     config_dict = config.to_dict()
     config_dict["model_type"] = model_type
     with wandb.init(project="fun_attention", config=config.to_dict()) as run:
-        run.watch(model, criterion=criterion, log="all", log_freq=100)
+        run.watch(model, criterion=criterion, log="all", log_freq=config.log_steps)
 
         t0 = time.time()
 
@@ -258,7 +277,7 @@ def train_variant(
                         "train_perplexity": torch.exp(torch.tensor(loss_value)).item(),
                     }
 
-                    if global_step % 100 == 0:
+                    if global_step % config.log_steps == 0:
                         t = time.time() - t0
                         print(
                             f"Epoch {epoch + 1} | Step {global_step}/{config.epochs * len(train_loader)} | Time: {t:.2f}s | Train Loss: {loss.item():.4f}"
@@ -408,27 +427,27 @@ train_loader, val_loader, tokenizer = prepare_tiny_stories(config)
 vocab_size = len(tokenizer)
 
 # 1. Train with Fast Variants
-std_model_fast, std_train_loss, std_val_loss, std_train_steps, std_val_steps = (
-    train_variant(
-        "standard",
-        train_loader,
-        val_loader,
-        vocab_size,
-        tokenizer.pad_token_id,
-        config=config,
-        save_path="outputs/standard_weights.pt",
-    )
-)
-
 rbf_model_fast, rbf_train_loss, rbf_val_loss, rbf_train_steps, rbf_val_steps = (
     train_variant(
-        "rbf_triton",
+        config.rbf_training_attention,
         train_loader,
         val_loader,
         vocab_size,
         tokenizer.pad_token_id,
         config=config,
         save_path="outputs/rbf_weights.pt",
+    )
+)
+
+std_model_fast, std_train_loss, std_val_loss, std_train_steps, std_val_steps = (
+    train_variant(
+        config.standard_training_attention,
+        train_loader,
+        val_loader,
+        vocab_size,
+        tokenizer.pad_token_id,
+        config=config,
+        save_path="outputs/standard_weights.pt",
     )
 )
 
@@ -440,7 +459,7 @@ std_model_slow = CausalLM(
     num_layers=config.num_layers,
     emb_dim=config.emb_dim,
     num_heads=config.num_heads,
-    attention_type="standard_slow",
+    attention_type=config.standard_eval_attention,
     max_seq_len=config.max_seq_len,
 ).to(config.device)
 std_model_slow.load_state_dict(
@@ -452,7 +471,7 @@ rbf_model_slow = CausalLM(
     num_layers=config.num_layers,
     emb_dim=config.emb_dim,
     num_heads=config.num_heads,
-    attention_type="rbf_slow",
+    attention_type=config.rbf_eval_attention,
     max_seq_len=config.max_seq_len,
 ).to(config.device)
 rbf_model_slow.load_state_dict(torch.load("outputs/rbf_weights.pt", weights_only=True))
