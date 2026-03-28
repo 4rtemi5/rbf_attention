@@ -43,11 +43,16 @@ I trained a small causal language model from scratch on TinyStories to compare s
 In this limited setting, the RBF attention model converged a bit faster and reached a slightly lower validation loss.  
 ![Loss Plot](outputs/loss_plot.png)
 
-**2. Kernel Profiling**  
-Thanks to the Triton implementation, the memory footprint stays low, and the forward/backward pass speeds are highly competitive with PyTorch's native SDPA.  
+**2. Attention Maps:**
+You can see how the regularized attention distribution differ between standard attention and rbf attention.  
+![Standard Attention Maps](outputs/standard_attention.png)
+![RBF Attention Maps](outputs/rbf_attention.png)
+
+
+**3. Kernel Profiling**  
+Thanks to the Triton implementation, the memory footprint stays low, and the forward/backward pass speeds are highly competitive with PyTorch's native and super-optimized SDPA.  
 ![Profiling Results](outputs/attention_profiling_results.png)
 
-*(You can also see visualizations of the raw attention maps in `outputs/rbf_attention.png` and `outputs/standard_attention.png` to see how the regularized attention distribution differs visually.)*
 
 ## 📂 Repository Structure
 

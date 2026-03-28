@@ -31,6 +31,8 @@ class TrainingConfig:
     validation_ratio: float = 0.001
 
     # Training params
+    train_rbf = False
+    train_standard = False
     epochs: int = 1
     log_steps: int = 100
     eval_steps: int = 500  # Evaluate every N steps
@@ -40,11 +42,14 @@ class TrainingConfig:
     standard_training_attention: str = "standard"
     rbf_training_attention: str = "rbf"
 
+    # use slow variants for evaluation to be able to output attention maps
     standard_eval_attention: str = "standard_slow"
     rbf_eval_attention: str = "rbf_slow"
 
     # Generation params
-    prompt: str = "Once upon a time, a little boy named Tim"
+    prompt: str = (
+        "Once upon a time, a little boy named Tim wanted to play with a little "
+    )
     max_gen_length: int = 512
 
     # Infrastructure
@@ -374,9 +379,7 @@ def generate_story(model, tokenizer, prompt, config: TrainingConfig):
     return tokenizer.decode(input_ids[0], skip_special_tokens=True)
 
 
-def visualize_attention_hf(
-    model, tokenizer, prompt, config: TrainingConfig, save_path=None
-):
+def visualize_attention_hf(model, tokenizer, prompt, config, save_path=None):
     model.eval()
     input_ids = tokenizer.encode(prompt, return_tensors="pt").to(config.device)
     tokens = [t.replace("Ġ", "") for t in tokenizer.convert_ids_to_tokens(input_ids[0])]
@@ -396,7 +399,11 @@ def visualize_attention_hf(
     attn_weights_to_plot = attn_weights[0][0].cpu()
     num_heads = attn_weights_to_plot.shape[0]
 
-    fig, axes = plt.subplots(1, num_heads, figsize=(5 * num_heads, 4))
+    # FIX 1: Add layout="constrained" to handle dynamic sizing for tall labels
+    fig, axes = plt.subplots(
+        1, num_heads, figsize=(5 * num_heads, 4), layout="constrained"
+    )
+
     if num_heads == 1:
         axes = [axes]
 
@@ -406,10 +413,15 @@ def visualize_attention_hf(
         axes[h].set_yticks(range(len(tokens)))
         axes[h].set_xticklabels(tokens, rotation=90, ha="left")
         axes[h].set_yticklabels(tokens)
-        axes[h].set_title(f"Head {h + 1}")
+
+        # FIX 2: Add a pad so the subplot titles don't overlap with the vertical x-ticks
+        axes[h].set_title(f"Head {h + 1}", pad=10)
+
         fig.colorbar(cax, ax=axes[h], fraction=0.046, pad=0.04)
 
-    plt.suptitle(f"{attention_type.upper()} Attention Weights", y=1.05)
+    # FIX 3: Remove the hardcoded y=1.05 and let the layout engine place it properly
+    plt.suptitle(f"{attention_type.upper()} Attention Weights")
+
     if save_path:
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         plt.savefig(save_path, bbox_inches="tight")
@@ -426,32 +438,34 @@ os.makedirs("outputs", exist_ok=True)
 train_loader, val_loader, tokenizer = prepare_tiny_stories(config)
 vocab_size = len(tokenizer)
 
-# 1. Train with Fast Variants
-rbf_model_fast, rbf_train_loss, rbf_val_loss, rbf_train_steps, rbf_val_steps = (
-    train_variant(
-        config.rbf_training_attention,
-        train_loader,
-        val_loader,
-        vocab_size,
-        tokenizer.pad_token_id,
-        config=config,
-        save_path="outputs/rbf_weights.pt",
+# Training
+if config.train_rbf:
+    rbf_model_fast, rbf_train_loss, rbf_val_loss, rbf_train_steps, rbf_val_steps = (
+        train_variant(
+            config.rbf_training_attention,
+            train_loader,
+            val_loader,
+            vocab_size,
+            tokenizer.pad_token_id,
+            config=config,
+            save_path="outputs/rbf_weights.pt",
+        )
     )
-)
 
-std_model_fast, std_train_loss, std_val_loss, std_train_steps, std_val_steps = (
-    train_variant(
-        config.standard_training_attention,
-        train_loader,
-        val_loader,
-        vocab_size,
-        tokenizer.pad_token_id,
-        config=config,
-        save_path="outputs/standard_weights.pt",
+if config.train_standard:
+    std_model_fast, std_train_loss, std_val_loss, std_train_steps, std_val_steps = (
+        train_variant(
+            config.standard_training_attention,
+            train_loader,
+            val_loader,
+            vocab_size,
+            tokenizer.pad_token_id,
+            config=config,
+            save_path="outputs/standard_weights.pt",
+        )
     )
-)
 
-# 2. Instantiate Slow Models for Evaluation
+# Evaluation
 print("Loading saved weights into SLOW models for evaluation and visualization...")
 
 std_model_slow = CausalLM(
@@ -505,35 +519,40 @@ visualize_attention_hf(
 )
 
 # 5. Plot Loss
-plt.figure(figsize=(10, 6))
-plt.plot(
-    std_train_steps,
-    std_train_loss,
-    label="Standard Train Loss",
-    color="blue",
-    linestyle="-",
-)
-plt.plot(
-    std_val_steps, std_val_loss, label="Standard Val Loss", color="blue", linestyle="--"
-)
-plt.plot(
-    rbf_train_steps,
-    rbf_train_loss,
-    label="New&Fun Train Loss",
-    color="orange",
-    linestyle="-",
-)
-plt.plot(
-    rbf_val_steps,
-    rbf_val_loss,
-    label="New&Fun Val Loss",
-    color="orange",
-    linestyle="--",
-)
-plt.xlabel("Steps")
-plt.ylabel("Loss")
-plt.title("Training and Validation Loss Comparison")
-plt.legend()
-plt.grid(True)
-plt.savefig("outputs/loss_plot.png", bbox_inches="tight")
-plt.close()
+if config.train_rbf and config.train_standard:
+    plt.figure(figsize=(10, 6))
+    plt.plot(
+        std_train_steps,
+        std_train_loss,
+        label="Standard Train Loss",
+        color="blue",
+        linestyle="-",
+    )
+    plt.plot(
+        std_val_steps,
+        std_val_loss,
+        label="Standard Val Loss",
+        color="blue",
+        linestyle="--",
+    )
+    plt.plot(
+        rbf_train_steps,
+        rbf_train_loss,
+        label="New&Fun Train Loss",
+        color="orange",
+        linestyle="-",
+    )
+    plt.plot(
+        rbf_val_steps,
+        rbf_val_loss,
+        label="New&Fun Val Loss",
+        color="orange",
+        linestyle="--",
+    )
+    plt.xlabel("Steps")
+    plt.ylabel("Loss")
+    plt.title("Training and Validation Loss Comparison")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig("outputs/loss_plot.png", bbox_inches="tight")
+    plt.close()

@@ -1,0 +1,7 @@
+torch
+einops
+triton
+matplotlib
+transformers
+datasets
+wandb

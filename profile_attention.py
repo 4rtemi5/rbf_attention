@@ -15,7 +15,6 @@ from rbf_attention import (
 BATCH_SIZE = 4
 NUM_HEADS = 8
 HEAD_DIM = 64
-# Sweeping from 1K to 8K context lengths
 SEQ_LENS = [1024, 2048, 4096, 8192]
 DEVICE = "cuda"
 
@@ -77,7 +76,7 @@ def run_benchmarks():
 
     results = {
         "SDPA Baseline": {"fwd": [], "bwd": [], "mem": []},
-        "RBF Math": {"fwd": [], "bwd": [], "mem": []},
+        "Naiive RBF Math": {"fwd": [], "bwd": [], "mem": []},
         "RBF Triton": {"fwd": [], "bwd": [], "mem": []},
         # "Non-Softmax Math": {"fwd": [], "bwd": [], "mem": []},
         # "Non-Softmax Triton": {"fwd": [], "bwd": [], "mem": []},
@@ -119,7 +118,7 @@ def run_benchmarks():
                 "SDPA Baseline",
                 lambda: F.scaled_dot_product_attention(q, k, v, is_causal=True),
             ),
-            ("RBF Math", lambda: rbf_math_forward(q, k, v)),
+            ("Naiive RBF Math", lambda: rbf_math_forward(q, k, v)),
             ("RBF Triton", lambda: TritonScaledRBFAttention.apply(q, k, v, True)),
             # ("Non-Softmax Math", lambda: rbf_non_softmax_math_forward(q, k, v)),
             # (
@@ -142,10 +141,10 @@ def run_benchmarks():
                 # Measure Backward Time
                 out = fn()
                 bwd_ms = triton.testing.do_bench(
-                    lambda: out.backward(dout, retain_graph=True), quantiles=None
+                    lambda: out.backward(dout, retain_graph=True),  # noqa: F821
+                    quantiles=None,
                 )
 
-                # --- FIX: CLEAR THE AUTOGRAD GRAPH MEMORY LEAK ---
                 del out
                 torch.cuda.empty_cache()
 
