@@ -31,8 +31,8 @@ class TrainingConfig:
     validation_ratio: float = 0.001
 
     # Training params
-    train_rbf = False
-    train_standard = False
+    train_rbf = True
+    train_standard = True
     epochs: int = 1
     log_steps: int = 100
     eval_steps: int = 500  # Evaluate every N steps
