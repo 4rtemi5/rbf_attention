@@ -4,7 +4,8 @@ This repository contains a small research experiment: replacing the standard Sca
 
 Instead of measuring similarity via the dot product of queries and keys, what if they attended to each other based on their squared Euclidean distance? 
 
-I tested this idea on a small scale using the [TinyStories](https://arxiv.org/abs/2305.07759) dataset. Surprisingly, it converged smoothly and performed slightly better than standard SDPA in this simple setup. To make this actually practical to train without tanking performance, I also wrote a custom fused Triton kernel.
+I tested this idea on a small scale using the [TinyStories](https://arxiv.org/abs/2305.07759) dataset. Surprisingly, it converged smoothly and performed slightly better than standard SDPA in this simple setup. To make this actually practical to train without tanking performance, I also wrote a custom fused Triton kernel.  
+![Loss Plot](outputs/w&b_plot_cropped.png)
 
 ## 🧮 The Math: Why this isn't incredibly slow
 
