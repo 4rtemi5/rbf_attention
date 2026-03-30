@@ -1299,6 +1299,7 @@ class CustomCausalAttention(nn.Module):
         q, k, v = rearrange(
             qkv, "b s (qkv h n) -> qkv b h s n", qkv=3, h=self.num_heads
         )
+
         attn_weights = None
 
         if self.attention_type == "standard":

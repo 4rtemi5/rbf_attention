@@ -20,10 +20,11 @@ class TrainingConfig:
     """Configuration for the training script."""
 
     # Model params
-    emb_dim: int = 256
-    num_layers: int = 4
-    num_heads: int = 4
-    max_seq_len: int = 512
+    emb_dim: int = 512
+    num_layers: int = 8
+    num_heads: int = 8
+    max_seq_len: int = 256
+    num_registers: int = 4
 
     # Dataset params
     batch_size: int = 64
@@ -35,8 +36,8 @@ class TrainingConfig:
     train_standard = True
     epochs: int = 1
     log_steps: int = 100
-    eval_steps: int = 500  # Evaluate every N steps
-    learning_rate: float = 3e-3
+    eval_steps: int = 1000  # Evaluate every N steps
+    learning_rate: float = 1e-3
     warmup_steps: int = 1000
     use_amp: bool = torch.cuda.is_available()
     standard_training_attention: str = "standard"
@@ -62,15 +63,6 @@ class TrainingConfig:
         return cls(**d)
 
 
-def compute_rbf_logits(q, k):
-    q_sq = q.pow(2).sum(dim=-1, keepdim=True)
-    k_sq = k.pow(2).sum(dim=-1).unsqueeze(-2)
-    dot_product = q @ k.swapaxes(-2, -1)
-    dist_sq = q_sq + k_sq - 2.0 * dot_product
-    dist_sq = torch.relu(dist_sq)
-    return -dist_sq / (q.size(-1) ** 0.5)
-
-
 class TransformerBlock(nn.Module):
     def __init__(self, emb_dim, num_heads, attention_type):
         super().__init__()
@@ -92,30 +84,59 @@ class CausalLM(nn.Module):
     def __init__(
         self,
         vocab_size,
-        emb_dim=256,
+        d_model=256,
         num_layers=4,
         num_heads=4,
         attention_type="standard",
         max_seq_len=1024,
+        num_registers=4,
     ):
         super().__init__()
-        self.embedding = nn.Embedding(vocab_size, emb_dim)
-        self.pos_embedding = nn.Parameter(torch.randn(1, max_seq_len, emb_dim))
-        self.layers = nn.ModuleList(
+        self.num_registers = num_registers
+
+        # Learnable Register Tokens
+        if self.num_registers > 0:
+            self.register_tokens = nn.Parameter(
+                torch.randn(num_registers, d_model) * (d_model**-0.5)
+            )
+
+        self.token_emb = nn.Embedding(vocab_size, d_model)
+        self.pos_emb = nn.Embedding(max_seq_len, d_model)
+        self.blocks = nn.ModuleList(
             [
-                TransformerBlock(emb_dim, num_heads, attention_type)
+                TransformerBlock(d_model, num_heads, attention_type)
                 for _ in range(num_layers)
             ]
         )
-        self.to_logits = nn.Linear(emb_dim, vocab_size)
+        self.ln_f = nn.LayerNorm(d_model)
+        self.to_logits = nn.Linear(d_model, vocab_size)
 
-    def forward(self, x):
-        x = self.embedding(x) + self.pos_embedding[:, : x.size(1), :]
+    def forward(self, idx):
+        B, T = idx.size()
+
+        x = self.token_emb(idx)
+
+        positions = torch.arange(T, device=idx.device)
+        x = x + self.pos_emb(positions)
+
+        # Prepend the Register Tokens
+        if self.num_registers > 0:
+            r = self.register_tokens.unsqueeze(0).expand(B, -1, -1)
+            x = torch.cat([r, x], dim=1)
+
         all_attn_weights = []
-        for layer in self.layers:
-            x, attn_weights = layer(x)
+        for block in self.blocks:
+            x, attn_weights = block(x)
             all_attn_weights.append(attn_weights)
-        return self.to_logits(x), all_attn_weights
+
+        # Slice off the register tokens
+        if self.num_registers > 0:
+            x = x[:, self.num_registers :, :]
+
+        x = self.ln_f(x)
+        logits = self.to_logits(x)
+
+        return logits, all_attn_weights
 
 
 def prepare_tiny_stories(config: TrainingConfig):
@@ -133,7 +154,7 @@ def prepare_tiny_stories(config: TrainingConfig):
             examples["text"],
             truncation=True,
             padding="max_length",
-            max_length=config.max_seq_len + 1,
+            max_length=config.max_seq_len - config.num_registers,
         )
 
     print("Tokenizing dataset...")
@@ -168,11 +189,10 @@ def prepare_tiny_stories(config: TrainingConfig):
 def oom_detection(device):
     try:
         yield
-    except RuntimeError as e:
-        if "out of memory" in str(e).lower():
-            print("CUDA OOM detected! Here is the memory state:")
-            print(torch.cuda.memory_summary(device=device))
-            torch.cuda.empty_cache()
+    except torch.OutOfMemoryError as e:
+        print("CUDA OOM detected! Here is the memory state:")
+        print(torch.cuda.memory_summary(device=device))
+        torch.cuda.empty_cache()
         raise e
 
 
@@ -188,10 +208,11 @@ def train_variant(
     model = CausalLM(
         vocab_size=vocab_size,
         num_layers=config.num_layers,
-        emb_dim=config.emb_dim,
+        d_model=config.emb_dim,
         num_heads=config.num_heads,
         attention_type=model_type,
         max_seq_len=config.max_seq_len,
+        num_registers=config.num_registers,
     ).to(config.device)
 
     if config.device == "cuda":
@@ -280,6 +301,9 @@ def train_variant(
                         "loss": loss_value,
                         "lr": scheduler.get_last_lr()[0],
                         "train_perplexity": torch.exp(torch.tensor(loss_value)).item(),
+                        "register_norm": model.register_tokens.data.norm(dim=-1)
+                        .mean()
+                        .item(),
                     }
 
                     if global_step % config.log_steps == 0:
