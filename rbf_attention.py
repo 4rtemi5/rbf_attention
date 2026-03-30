@@ -1264,6 +1264,36 @@ class TritonNonSoftmaxRBFAttention(torch.autograd.Function):
         return dq, dk, dv, None
 
 
+def precompute_freqs_cis(dim, end, theta=10000.0):
+    """Precomputes the frequency tensor for RoPE."""
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    t = torch.arange(end, device=freqs.device)
+    freqs = torch.outer(t, freqs).float()
+    # Duplicate the frequencies to match the head dimension
+    freqs = torch.cat((freqs, freqs), dim=-1)
+
+    cos = torch.cos(freqs)
+    sin = torch.sin(freqs)
+    return cos, sin
+
+
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary_pos_emb(q, k, cos, sin):
+    """Applies Rotary Position Embedding to q and k."""
+    # Reshape cos and sin to broadcast with q and k: [batch, heads, seq_len, head_dim]
+    cos = cos.unsqueeze(0).unsqueeze(0)
+    sin = sin.unsqueeze(0).unsqueeze(0)
+
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed.type_as(q), k_embed.type_as(k)
+
+
 def compute_rbf_logits(q, k):
     q_sq = q.pow(2).sum(dim=-1, keepdim=True)
     k_sq = k.pow(2).sum(dim=-1).unsqueeze(-2)
@@ -1274,7 +1304,14 @@ def compute_rbf_logits(q, k):
 
 
 class CustomCausalAttention(nn.Module):
-    def __init__(self, num_heads, emb_dims, attention_type="standard"):
+    def __init__(
+        self,
+        num_heads,
+        emb_dims,
+        max_seq_len=2048,
+        use_rope=True,
+        attention_type="standard",
+    ):
         assert (
             attention_type
             in [
@@ -1289,9 +1326,16 @@ class CustomCausalAttention(nn.Module):
         ), f"Unknown attention type: {attention_type}"
         super().__init__()
         self.num_heads = num_heads
+        self.use_rope = use_rope
         self.attention_type = attention_type
         self.qkv_proj = nn.Linear(emb_dims, 3 * emb_dims)
         self.proj = nn.Linear(emb_dims, emb_dims)
+
+        if self.use_rope:
+            self.head_dim = emb_dims // num_heads
+            cos, sin = precompute_freqs_cis(self.head_dim, max_seq_len)
+            self.register_buffer("cos", cos, persistent=False)
+            self.register_buffer("sin", sin, persistent=False)
 
     def forward(self, x):
         b, s, _ = x.shape
@@ -1299,6 +1343,12 @@ class CustomCausalAttention(nn.Module):
         q, k, v = rearrange(
             qkv, "b s (qkv h n) -> qkv b h s n", qkv=3, h=self.num_heads
         )
+
+        # apply RoPE
+        if self.use_rope:
+            cos_seq = self.cos[:s, :]
+            sin_seq = self.sin[:s, :]
+            q, k = apply_rotary_pos_emb(q, k, cos_seq, sin_seq)
 
         attn_weights = None
 

@@ -51,7 +51,7 @@ class TrainingConfig:
     prompt: str = (
         "Once upon a time, a little boy named Tim wanted to play with a little "
     )
-    max_gen_length: int = 512
+    max_gen_length: int = 256
 
     # Infrastructure
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -64,9 +64,11 @@ class TrainingConfig:
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, emb_dim, num_heads, attention_type):
+    def __init__(self, emb_dim, num_heads, max_seq_len, use_rope, attention_type):
         super().__init__()
-        self.attn = CustomCausalAttention(num_heads, emb_dim, attention_type)
+        self.attn = CustomCausalAttention(
+            num_heads, emb_dim, max_seq_len, use_rope, attention_type
+        )
         self.ln1 = nn.LayerNorm(emb_dim)
         self.ff = nn.Sequential(
             nn.Linear(emb_dim, emb_dim * 4), nn.GELU(), nn.Linear(emb_dim * 4, emb_dim)
@@ -87,9 +89,10 @@ class CausalLM(nn.Module):
         d_model=256,
         num_layers=4,
         num_heads=4,
-        attention_type="standard",
         max_seq_len=1024,
+        use_rope=True,
         num_registers=4,
+        attention_type="standard",
     ):
         super().__init__()
         self.num_registers = num_registers
@@ -102,14 +105,21 @@ class CausalLM(nn.Module):
                 )
             elif attention_type.startswith("rbf"):
                 self.register_tokens = nn.Parameter(torch.zeros(num_registers, d_model))
+                # self.register_buffer(
+                #     "register_tokens", torch.zeros(num_registers, d_model)
+                # )
             else:
                 raise ValueError(f"Unsupported attention type: {attention_type}")
 
         self.token_emb = nn.Embedding(vocab_size, d_model)
-        self.pos_emb = nn.Embedding(max_seq_len, d_model)
+        self.use_rope = use_rope
+        if not self.use_rope:
+            self.pos_emb = nn.Embedding(max_seq_len, d_model)
         self.blocks = nn.ModuleList(
             [
-                TransformerBlock(d_model, num_heads, attention_type)
+                TransformerBlock(
+                    d_model, num_heads, max_seq_len, use_rope, attention_type
+                )
                 for _ in range(num_layers)
             ]
         )
@@ -121,8 +131,9 @@ class CausalLM(nn.Module):
 
         x = self.token_emb(idx)
 
-        positions = torch.arange(T, device=idx.device)
-        x = x + self.pos_emb(positions)
+        if not self.use_rope:
+            positions = torch.arange(T, device=idx.device)
+            x = x + self.pos_emb(positions)
 
         # Prepend the Register Tokens
         if self.num_registers > 0:
@@ -215,9 +226,10 @@ def train_variant(
         num_layers=config.num_layers,
         d_model=config.emb_dim,
         num_heads=config.num_heads,
-        attention_type=model_type,
         max_seq_len=config.max_seq_len,
+        use_rope=True,
         num_registers=config.num_registers,
+        attention_type=model_type,
     ).to(config.device)
 
     if config.device == "cuda":
@@ -502,8 +514,10 @@ std_model_slow = CausalLM(
     num_layers=config.num_layers,
     d_model=config.emb_dim,
     num_heads=config.num_heads,
-    attention_type=config.standard_eval_attention,
     max_seq_len=config.max_seq_len,
+    use_rope=True,
+    num_registers=config.num_registers,
+    attention_type=config.standard_eval_attention,
 ).to(config.device)
 std_model_slow.load_state_dict(
     torch.load("outputs/standard_weights.pt", weights_only=True)
@@ -514,8 +528,10 @@ rbf_model_slow = CausalLM(
     num_layers=config.num_layers,
     d_model=config.emb_dim,
     num_heads=config.num_heads,
-    attention_type=config.rbf_eval_attention,
     max_seq_len=config.max_seq_len,
+    use_rope=True,
+    num_registers=config.num_registers,
+    attention_type=config.rbf_eval_attention,
 ).to(config.device)
 rbf_model_slow.load_state_dict(torch.load("outputs/rbf_weights.pt", weights_only=True))
 
