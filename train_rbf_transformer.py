@@ -32,8 +32,8 @@ class TrainingConfig:
     validation_ratio: float = 0.001
 
     # Training params
-    train_rbf = True
-    train_standard = True
+    train_rbf = False
+    train_standard = False
     epochs: int = 1
     log_steps: int = 100
     eval_steps: int = 1000  # Evaluate every N steps
@@ -96,9 +96,14 @@ class CausalLM(nn.Module):
 
         # Learnable Register Tokens
         if self.num_registers > 0:
-            self.register_tokens = nn.Parameter(
-                torch.randn(num_registers, d_model) * (d_model**-0.5)
-            )
+            if attention_type.startswith("standard"):
+                self.register_tokens = nn.Parameter(
+                    torch.randn(num_registers, d_model) * (d_model**-0.5)
+                )
+            elif attention_type.startswith("rbf"):
+                self.register_tokens = nn.Parameter(torch.zeros(num_registers, d_model))
+            else:
+                raise ValueError(f"Unsupported attention type: {attention_type}")
 
         self.token_emb = nn.Embedding(vocab_size, d_model)
         self.pos_emb = nn.Embedding(max_seq_len, d_model)
@@ -412,7 +417,7 @@ def visualize_attention_hf(model, tokenizer, prompt, config, save_path=None):
         _, attn_weights = model(input_ids)
 
     unwrapped_model = model._orig_mod if hasattr(model, "_orig_mod") else model
-    attention_type = unwrapped_model.layers[0].attn.attention_type
+    attention_type = unwrapped_model.blocks[0].attn.attention_type
 
     if attn_weights is None or attn_weights[0] is None:
         print(
@@ -495,7 +500,7 @@ print("Loading saved weights into SLOW models for evaluation and visualization..
 std_model_slow = CausalLM(
     vocab_size=vocab_size,
     num_layers=config.num_layers,
-    emb_dim=config.emb_dim,
+    d_model=config.emb_dim,
     num_heads=config.num_heads,
     attention_type=config.standard_eval_attention,
     max_seq_len=config.max_seq_len,
@@ -507,7 +512,7 @@ std_model_slow.load_state_dict(
 rbf_model_slow = CausalLM(
     vocab_size=vocab_size,
     num_layers=config.num_layers,
-    emb_dim=config.emb_dim,
+    d_model=config.emb_dim,
     num_heads=config.num_heads,
     attention_type=config.rbf_eval_attention,
     max_seq_len=config.max_seq_len,
