@@ -1,8 +1,10 @@
-# RBF Attention
+# RBF-Attention
 
 A quick experiment swapping out the standard Scaled Dot-Product Attention (SDPA) in Transformers for a distance-based metric: the negative Radial Basis Function (RBF) kernel.
 
 Basically, what happens if queries and keys attend to each other based on their squared Euclidean distance instead of a dot product? 
+
+**Read the full deep-dive on my blog:** [Scaled RBF Attention: Trading Dot Products for Euclidean Distance](https://pisoni.ai/posts/scaled-rbf-attention/)
 
 I ran a small-scale test using the [TinyStories](https://arxiv.org/abs/2305.07759) dataset. It actually converged and performed slightly better than standard SDPA in this constrained setup. Since computing exact pairwise distances is usually a performance killer, I also put together a custom fused Triton kernel to keep it practical to train.  
 ![Loss Plot](outputs/w&b_plot_cropped.png)
@@ -23,16 +25,25 @@ $$\text{softmax}(-\gamma ||q - k||^2) \equiv \text{softmax}\big(2\gamma(q \cdot 
 
 **What this means:** RBF Attention is mathematically just standard dot-product attention with a built-in $L_2$ penalty on the keys. It naturally acts as a geometric regularizer, penalizing outlier keys from growing massive norms and hoarding all the attention (acting as "attention sinks").
 
-## Triton Implementation
+## Architectural Adjustments for RBF
+
+Distance-based attention inherently changes how vectors interact compared to dot products, which required two main architectural tweaks:
+
+1. **Subspace Sinusoidal Embeddings (SuSiE)**: Standard RoPE interferes poorly with distance-based metrics because rotations alter relative Euclidean distances in unintended ways. Instead, this repo defaults to SuSiE for the RBF variants, using unrotated sinusoids with a learnable scale parameter (`pos_weight`) to allow semantic similarity to dominate early in training.
+2. **Register Tokens**: To give the model a safe place to "look away", we prepend learned Register Tokens to the sequence. For RBF attention, these are carefully zero-initialized to ensure proper distance centering ($||q - 0||^2 = ||q||^2$) and avert dead gradients early in training.
+
+## Triton Implementation & Non-Softmax Variants
 
 Even with the math trick, doing this naively in PyTorch requires materializing the full $N \times N$ attention matrix just to subtract the key norms before the softmax. That instantly chokes memory bandwidth and causes OOMs on longer sequences.
 
-To fix this, I wrote a custom fused kernel (`rbf_attention.py`), borrowing heavily from FlashAttention:
+To fix this, I wrote custom fused kernels (`rbf_attention.py`), borrowing heavily from FlashAttention:
 1. It computes the $Q K^T$ block using fast hardware Tensor Cores.
 2. It computes and subtracts the squared $L_2$ norms of the keys ($||k||^2$) directly in SRAM.
 3. It applies the scaling and softmax, multiplies by $V$, and then writes the result back to global memory.
 
 *(You can run `test_equivalence.py` and `rbf_math_test.py` to verify that the PyTorch math and the Triton kernel match exactly).*
+
+**Experimental Non-Softmax Kernel:** The codebase also includes `TritonNonSoftmaxRBFAttention`, which completely removes the softmax denominator and relies purely on the bounding properties of the RBF exponential (since distances are strictly $\leq 0$).
 
 ## Results
 
