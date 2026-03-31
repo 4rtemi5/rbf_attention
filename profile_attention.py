@@ -173,7 +173,7 @@ def run_benchmarks():
     return results
 
 
-def plot_results(results):
+def plot_results(results, filename="attention_profiling_results.png"):
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
     metrics = [
         ("fwd", "Forward Time (ms)"),
@@ -192,8 +192,8 @@ def plot_results(results):
         ax.legend()
 
     plt.tight_layout()
-    plt.savefig("outputs/attention_profiling_results.png")
-    print("\nSaved benchmark plots to 'outputs/attention_profiling_results.png'")
+    plt.savefig(f"outputs/{filename}")
+    print(f"\nSaved benchmark plots to 'outputs/{filename}'")
 
 
 if __name__ == "__main__":
@@ -202,4 +202,4 @@ if __name__ == "__main__":
     torch.backends.cudnn.allow_tf32 = True
 
     results = run_benchmarks()
-    plot_results(results)
+    plot_results(results, filename="attention_profiling_results.png")

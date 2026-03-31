@@ -20,11 +20,12 @@ class TrainingConfig:
     """Configuration for the training script."""
 
     # Model params
-    emb_dim: int = 512
-    num_layers: int = 8
-    num_heads: int = 8
+    emb_dim: int = 256
+    num_layers: int = 4
+    num_heads: int = 4
     max_seq_len: int = 256
-    num_registers: int = 4
+    num_registers: int = 1
+    pos_emb_type: str = "rope"  # none, rope, learned
 
     # Dataset params
     batch_size: int = 64
@@ -51,7 +52,7 @@ class TrainingConfig:
     prompt: str = (
         "Once upon a time, a little boy named Tim wanted to play with a little "
     )
-    max_gen_length: int = 256
+    max_gen_length: int = 1024
 
     # Infrastructure
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -63,11 +64,59 @@ class TrainingConfig:
         return cls(**d)
 
 
+def prepare_tiny_stories(
+    batch_size, max_seq_len, sample_ratio="100%", validation_ratio=0.01, num_registers=0
+):
+    print("Loading tokenizer and dataset...")
+    tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neo-125m")
+    tokenizer.pad_token = tokenizer.eos_token
+
+    dataset = load_dataset("roneneldan/TinyStories", split=f"train[:{sample_ratio}]")
+    dataset = dataset.train_test_split(test_size=validation_ratio, seed=42)
+
+    def tokenize_fn(examples):
+        return tokenizer(
+            examples["text"],
+            truncation=True,
+            padding="max_length",
+            max_length=max_seq_len - num_registers,
+        )
+
+    print("Tokenizing dataset...")
+    tokenized_datasets = dataset.map(
+        tokenize_fn,
+        batched=True,
+        remove_columns=dataset["train"].column_names,
+        num_proc=8,
+    )
+    tokenized_datasets.set_format("torch", columns=["input_ids", "attention_mask"])
+
+    train_loader = DataLoader(
+        tokenized_datasets["train"],
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=8,
+        pin_memory=True,
+        prefetch_factor=2,
+    )
+    val_loader = DataLoader(
+        tokenized_datasets["test"],
+        batch_size=batch_size,
+        num_workers=8,
+        pin_memory=True,
+        prefetch_factor=2,
+    )
+
+    return train_loader, val_loader, tokenizer
+
+
 class TransformerBlock(nn.Module):
-    def __init__(self, emb_dim, num_heads, max_seq_len, use_rope, attention_type):
+    def __init__(
+        self, emb_dim, num_heads, max_seq_len, use_rope, attention_type, num_registers=0
+    ):
         super().__init__()
         self.attn = CustomCausalAttention(
-            num_heads, emb_dim, max_seq_len, use_rope, attention_type
+            num_heads, emb_dim, max_seq_len, use_rope, attention_type, num_registers
         )
         self.ln1 = nn.LayerNorm(emb_dim)
         self.ff = nn.Sequential(
@@ -90,35 +139,47 @@ class CausalLM(nn.Module):
         num_layers=4,
         num_heads=4,
         max_seq_len=1024,
-        use_rope=True,
-        num_registers=4,
+        pos_emb_type="none",  # none, rope, learned
+        num_registers=0,
         attention_type="standard",
     ):
         super().__init__()
         self.num_registers = num_registers
 
-        # Learnable Register Tokens
         if self.num_registers > 0:
             if attention_type.startswith("standard"):
                 self.register_tokens = nn.Parameter(
                     torch.randn(num_registers, d_model) * (d_model**-0.5)
                 )
             elif attention_type.startswith("rbf"):
+                # RBF requires proper distance centering. Initializing to zero ensures
+                # initial distance to queries is just ||q||^2, averting early dead gradients.
                 self.register_tokens = nn.Parameter(torch.zeros(num_registers, d_model))
-                # self.register_buffer(
-                #     "register_tokens", torch.zeros(num_registers, d_model)
-                # )
             else:
                 raise ValueError(f"Unsupported attention type: {attention_type}")
 
         self.token_emb = nn.Embedding(vocab_size, d_model)
-        self.use_rope = use_rope
-        if not self.use_rope:
+
+        self.pos_emb_type = pos_emb_type
+        if pos_emb_type == "learned":
             self.pos_emb = nn.Embedding(max_seq_len, d_model)
+            self.use_rope = False
+        elif pos_emb_type == "rope":
+            self.use_rope = True
+        elif pos_emb_type == "none":
+            self.use_rope = False
+        else:
+            raise ValueError(f"Unsupported pos_emb_type: {pos_emb_type}")
+
         self.blocks = nn.ModuleList(
             [
                 TransformerBlock(
-                    d_model, num_heads, max_seq_len, use_rope, attention_type
+                    d_model,
+                    num_heads,
+                    max_seq_len,
+                    self.use_rope,
+                    attention_type,
+                    num_registers,
                 )
                 for _ in range(num_layers)
             ]
@@ -131,7 +192,7 @@ class CausalLM(nn.Module):
 
         x = self.token_emb(idx)
 
-        if not self.use_rope:
+        if self.pos_emb_type == "learned":
             positions = torch.arange(T, device=idx.device)
             x = x + self.pos_emb(positions)
 
@@ -153,52 +214,6 @@ class CausalLM(nn.Module):
         logits = self.to_logits(x)
 
         return logits, all_attn_weights
-
-
-def prepare_tiny_stories(config: TrainingConfig):
-    print("Loading tokenizer and dataset...")
-    tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neo-125m")
-    tokenizer.pad_token = tokenizer.eos_token
-
-    dataset = load_dataset(
-        "roneneldan/TinyStories", split=f"train[:{config.sample_ratio}]"
-    )
-    dataset = dataset.train_test_split(test_size=config.validation_ratio, seed=42)
-
-    def tokenize_fn(examples):
-        return tokenizer(
-            examples["text"],
-            truncation=True,
-            padding="max_length",
-            max_length=config.max_seq_len - config.num_registers,
-        )
-
-    print("Tokenizing dataset...")
-    tokenized_datasets = dataset.map(
-        tokenize_fn,
-        batched=True,
-        remove_columns=dataset["train"].column_names,
-        num_proc=8,
-    )
-    tokenized_datasets.set_format("torch", columns=["input_ids", "attention_mask"])
-
-    train_loader = DataLoader(
-        tokenized_datasets["train"],
-        batch_size=config.batch_size,
-        shuffle=True,
-        num_workers=8,
-        pin_memory=True,
-        prefetch_factor=2,
-    )
-    val_loader = DataLoader(
-        tokenized_datasets["test"],
-        batch_size=config.batch_size,
-        num_workers=8,
-        pin_memory=True,
-        prefetch_factor=2,
-    )
-
-    return train_loader, val_loader, tokenizer
 
 
 @contextlib.contextmanager
@@ -227,7 +242,7 @@ def train_variant(
         d_model=config.emb_dim,
         num_heads=config.num_heads,
         max_seq_len=config.max_seq_len,
-        use_rope=True,
+        pos_emb_type=config.pos_emb_type,
         num_registers=config.num_registers,
         attention_type=model_type,
     ).to(config.device)
@@ -400,9 +415,11 @@ def generate_story(model, tokenizer, prompt, config: TrainingConfig):
     unwrapped_model.eval()
     input_ids = tokenizer.encode(prompt, return_tensors="pt").to(config.device)
 
+    max_text_len = config.max_seq_len - config.num_registers
+
     with torch.no_grad():
         for _ in range(config.max_gen_length):
-            context = input_ids[:, -config.max_seq_len :]
+            context = input_ids[:, -max_text_len:]
             with torch.amp.autocast(
                 device_type=config.device, dtype=torch.float16, enabled=config.use_amp
             ):
@@ -424,6 +441,15 @@ def visualize_attention_hf(model, tokenizer, prompt, config, save_path=None):
     model.eval()
     input_ids = tokenizer.encode(prompt, return_tensors="pt").to(config.device)
     tokens = [t.replace("Ġ", "") for t in tokenizer.convert_ids_to_tokens(input_ids[0])]
+
+    unwrapped_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+    attention_type = unwrapped_model.blocks[0].attn.attention_type
+    num_registers = getattr(unwrapped_model, "num_registers", 0)
+
+    # [FIX] Inject visual placeholders for Register Tokens to perfectly match axes geometry
+    if num_registers > 0:
+        reg_tokens = [f"[REG_{i}]" for i in range(num_registers)]
+        tokens = reg_tokens + tokens
 
     with torch.no_grad():
         _, attn_weights = model(input_ids)
@@ -476,7 +502,13 @@ def visualize_attention_hf(model, tokenizer, prompt, config, save_path=None):
 config = TrainingConfig()
 os.makedirs("outputs", exist_ok=True)
 
-train_loader, val_loader, tokenizer = prepare_tiny_stories(config)
+train_loader, val_loader, tokenizer = prepare_tiny_stories(
+    config.batch_size,
+    config.max_seq_len,
+    config.sample_ratio,
+    config.validation_ratio,
+    config.num_registers,
+)
 vocab_size = len(tokenizer)
 
 # Training
@@ -515,7 +547,7 @@ std_model_slow = CausalLM(
     d_model=config.emb_dim,
     num_heads=config.num_heads,
     max_seq_len=config.max_seq_len,
-    use_rope=True,
+    pos_emb_type=config.pos_emb_type,
     num_registers=config.num_registers,
     attention_type=config.standard_eval_attention,
 ).to(config.device)
@@ -529,7 +561,7 @@ rbf_model_slow = CausalLM(
     d_model=config.emb_dim,
     num_heads=config.num_heads,
     max_seq_len=config.max_seq_len,
-    use_rope=True,
+    pos_emb_type=config.pos_emb_type,
     num_registers=config.num_registers,
     attention_type=config.rbf_eval_attention,
 ).to(config.device)

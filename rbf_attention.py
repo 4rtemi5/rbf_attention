@@ -1294,12 +1294,18 @@ def apply_rotary_pos_emb(q, k, cos, sin):
     return q_embed.type_as(q), k_embed.type_as(k)
 
 
+def get_unrotated_sinusoids(seq_len, dim, device, theta=10000.0):
+    inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, device=device).float() / dim))
+    t = torch.arange(seq_len, device=device).float()
+    freqs = torch.outer(t, inv_freq)
+    return torch.cat((freqs.sin(), freqs.cos()), dim=-1)
+
+
 def compute_rbf_logits(q, k):
     q_sq = q.pow(2).sum(dim=-1, keepdim=True)
     k_sq = k.pow(2).sum(dim=-1).unsqueeze(-2)
     dot_product = q @ k.swapaxes(-2, -1)
     dist_sq = q_sq + k_sq - 2.0 * dot_product
-    dist_sq = torch.relu(dist_sq)
     return -dist_sq / (q.size(-1) ** 0.5)
 
 
@@ -1311,31 +1317,58 @@ class CustomCausalAttention(nn.Module):
         max_seq_len=2048,
         use_rope=True,
         attention_type="standard",
+        num_registers=0,
     ):
-        assert (
-            attention_type
-            in [
-                "standard",  # Standard Attention using F.scaled_dot_product_attention
-                "standard_slow",  # Explicit baseline implementation of Attention
-                "rbf_math",  # Mathematical equivalent of rbf-attention using F.scaled_dot_product_attention
-                "rbf",  # Triton Implementation of RBF-Attention
-                "rbf_slow",  # Baseline implementation of RBF-Attention
-                "rbf_non_softmax_slow",  # Non-Softmax RBF-Attention
-                "rbf_non_softmax",  # Triton Implementation of Non-Softmax RBF-Attention
-            ]
-        ), f"Unknown attention type: {attention_type}"
+        assert attention_type in [
+            "standard",
+            "standard_slow",
+            "rbf_math",
+            "rbf",
+            "rbf_slow",
+            "rbf_non_softmax_slow",
+            "rbf_non_softmax",
+        ], f"Unknown attention type: {attention_type}"
         super().__init__()
+
         self.num_heads = num_heads
-        self.use_rope = use_rope
         self.attention_type = attention_type
+        self.num_registers = num_registers
+        self.head_dim = emb_dims // num_heads
+
         self.qkv_proj = nn.Linear(emb_dims, 3 * emb_dims)
         self.proj = nn.Linear(emb_dims, emb_dims)
 
-        if self.use_rope:
-            self.head_dim = emb_dims // num_heads
+        self.positional_encoding_type = "none"
+        if use_rope:
+            if attention_type.startswith("standard"):
+                self.positional_encoding_type = "rope"
+            elif attention_type.startswith("rbf"):
+                self.positional_encoding_type = "susie"
+
+        if self.positional_encoding_type == "rope":
             cos, sin = precompute_freqs_cis(self.head_dim, max_seq_len)
             self.register_buffer("cos", cos, persistent=False)
             self.register_buffer("sin", sin, persistent=False)
+
+        elif self.positional_encoding_type == "susie":
+            self.pos_dim = self.head_dim
+
+            # 2. Learnable scale initialized to 0.5 (allows semantics to dominate early)
+            self.pos_weight = nn.Parameter(
+                torch.full((1, num_heads, 1, self.pos_dim // 2), 0.5)
+            )
+
+            # 3. Learnable positional embeddings specifically for Registers!
+            if self.num_registers > 0:
+                self.reg_pos_emb = nn.Parameter(
+                    torch.randn(1, num_heads, self.num_registers, self.pos_dim) * 0.02
+                )
+
+            # 4. Cache text sinusoids to save massive CPU-GPU sync overhead
+            susie_cache = get_unrotated_sinusoids(
+                max_seq_len, self.pos_dim, device="cpu"
+            )
+            self.register_buffer("susie_cache", susie_cache, persistent=False)
 
     def forward(self, x):
         b, s, _ = x.shape
@@ -1344,20 +1377,56 @@ class CustomCausalAttention(nn.Module):
             qkv, "b s (qkv h n) -> qkv b h s n", qkv=3, h=self.num_heads
         )
 
-        # apply RoPE
-        if self.use_rope:
-            cos_seq = self.cos[:s, :]
-            sin_seq = self.sin[:s, :]
-            q, k = apply_rotary_pos_emb(q, k, cos_seq, sin_seq)
+        if self.positional_encoding_type == "susie":
+            tied_weight = self.pos_weight.repeat(1, 1, 1, 2).to(q.dtype)
 
+            if self.num_registers > 0:
+                text_len = s - self.num_registers
+
+                pos_emb_seq = self.susie_cache[:text_len].to(
+                    device=q.device, dtype=q.dtype
+                )
+                pos_emb_seq = (
+                    pos_emb_seq.view(1, 1, text_len, self.pos_dim) * tied_weight
+                )
+
+                pos_emb_reg = self.reg_pos_emb.to(q.dtype)
+
+                pos_emb = torch.cat([pos_emb_reg, pos_emb_seq], dim=2)
+            else:
+                pos_emb = self.susie_cache[:s].to(device=q.device, dtype=q.dtype)
+                pos_emb = pos_emb.view(1, 1, s, self.pos_dim) * tied_weight
+
+            q = q + pos_emb
+            k = k + pos_emb
+
+        elif self.positional_encoding_type == "rope":
+            if self.num_registers > 0:
+                q_reg = q[:, :, : self.num_registers, :]
+                k_reg = k[:, :, : self.num_registers, :]
+                q_text = q[:, :, self.num_registers :, :]
+                k_text = k[:, :, self.num_registers :, :]
+
+                text_len = s - self.num_registers
+                cos_seq = self.cos[:text_len, :]
+                sin_seq = self.sin[:text_len, :]
+
+                q_text, k_text = apply_rotary_pos_emb(q_text, k_text, cos_seq, sin_seq)
+
+                q = torch.cat([q_reg, q_text], dim=2)
+                k = torch.cat([k_reg, k_text], dim=2)
+            else:
+                cos_seq = self.cos[:s, :]
+                sin_seq = self.sin[:s, :]
+                q, k = apply_rotary_pos_emb(q, k, cos_seq, sin_seq)
+
+        # Standard Attention Routing
         attn_weights = None
 
         if self.attention_type == "standard":
-            # Standard Attention using F.scaled_dot_product_attention
             out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
         elif self.attention_type == "standard_slow":
-            # Explicit baseline implementation of Attention
             attn_logits = q @ k.transpose(-2, -1)
             attn_logits = attn_logits / (q.size(-1) ** 0.5)
             causal_mask = torch.triu(
@@ -1368,16 +1437,10 @@ class CustomCausalAttention(nn.Module):
             out = attn_weights @ v
 
         elif self.attention_type == "rbf_math":
-            # Mathematical equivalent of rbf-attention using F.scaled_dot_product_attention
-            # Softmax shift-invariance natively cancels out ||q||^2 completely.
-
             k_sq = k.float().pow(2).sum(dim=-1, keepdim=True).to(k.dtype)
-
-            # Pad dimension components onto vectors to construct exact scaling map
             q_prime = torch.cat([q, torch.ones_like(q[..., :1])], dim=-1)
             k_prime = torch.cat([k, -0.5 * k_sq], dim=-1)
 
-            # Align hardware dimensions (Padding heads to an exact multiple of 8 unlocks FA hook)
             pad_len = (8 - (q_prime.shape[-1] % 8)) % 8
             if pad_len > 0:
                 q_prime = F.pad(q_prime, (0, pad_len))
@@ -1389,11 +1452,9 @@ class CustomCausalAttention(nn.Module):
             )
 
         elif self.attention_type == "rbf":
-            # Triton Implementation of RBF-Attention
             out = TritonScaledRBFAttention.apply(q, k, v, True)
 
         elif self.attention_type == "rbf_slow":
-            # Baseline implementation of RBF-Attention
             attn_logits = compute_rbf_logits(q, k)
             causal_mask = torch.triu(
                 torch.ones(s, s, device=x.device), diagonal=1
@@ -1403,7 +1464,6 @@ class CustomCausalAttention(nn.Module):
             out = attn_weights @ v
 
         elif self.attention_type == "rbf_non_softmax_slow":
-            # Non-Softmax RBF-Attention
             attn_logits = compute_rbf_logits(q, k)
             causal_mask = torch.triu(
                 torch.ones(s, s, device=x.device), diagonal=1
@@ -1411,9 +1471,10 @@ class CustomCausalAttention(nn.Module):
             attn_logits = attn_logits.masked_fill(causal_mask, float("-inf"))
             attn_weights = torch.exp(attn_logits)
             out = attn_weights @ v
+
         elif self.attention_type == "rbf_non_softmax":
-            # Triton Implementation of Non-Softmax RBF-Attention
             out = TritonNonSoftmaxRBFAttention.apply(q, k, v, True)
+
         else:
             raise ValueError(f"Unknown attention type: {self.attention_type}")
 
