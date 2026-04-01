@@ -498,138 +498,144 @@ def visualize_attention_hf(model, tokenizer, prompt, config, save_path=None):
 
 
 # --- Execution Block ---
+def main():
+    config = TrainingConfig()
+    os.makedirs("outputs", exist_ok=True)
 
-config = TrainingConfig()
-os.makedirs("outputs", exist_ok=True)
+    train_loader, val_loader, tokenizer = prepare_tiny_stories(
+        config.batch_size,
+        config.max_seq_len,
+        config.sample_ratio,
+        config.validation_ratio,
+        config.num_registers,
+    )
+    vocab_size = len(tokenizer)
 
-train_loader, val_loader, tokenizer = prepare_tiny_stories(
-    config.batch_size,
-    config.max_seq_len,
-    config.sample_ratio,
-    config.validation_ratio,
-    config.num_registers,
-)
-vocab_size = len(tokenizer)
-
-# Training
-if config.train_rbf:
-    rbf_model_fast, rbf_train_loss, rbf_val_loss, rbf_train_steps, rbf_val_steps = (
-        train_variant(
-            config.rbf_training_attention,
-            train_loader,
-            val_loader,
-            vocab_size,
-            tokenizer.pad_token_id,
-            config=config,
-            save_path="outputs/rbf_weights.pt",
+    # Training
+    if config.train_rbf:
+        rbf_model_fast, rbf_train_loss, rbf_val_loss, rbf_train_steps, rbf_val_steps = (
+            train_variant(
+                config.rbf_training_attention,
+                train_loader,
+                val_loader,
+                vocab_size,
+                tokenizer.pad_token_id,
+                config=config,
+                save_path="outputs/rbf_weights.pt",
+            )
         )
-    )
 
-if config.train_standard:
-    std_model_fast, std_train_loss, std_val_loss, std_train_steps, std_val_steps = (
-        train_variant(
-            config.standard_training_attention,
-            train_loader,
-            val_loader,
-            vocab_size,
-            tokenizer.pad_token_id,
-            config=config,
-            save_path="outputs/standard_weights.pt",
+    if config.train_standard:
+        std_model_fast, std_train_loss, std_val_loss, std_train_steps, std_val_steps = (
+            train_variant(
+                config.standard_training_attention,
+                train_loader,
+                val_loader,
+                vocab_size,
+                tokenizer.pad_token_id,
+                config=config,
+                save_path="outputs/standard_weights.pt",
+            )
         )
+
+    # Evaluation
+    print("Loading saved weights into SLOW models for evaluation and visualization...")
+
+    std_model_slow = CausalLM(
+        vocab_size=vocab_size,
+        num_layers=config.num_layers,
+        d_model=config.emb_dim,
+        num_heads=config.num_heads,
+        max_seq_len=config.max_seq_len,
+        pos_emb_type=config.pos_emb_type,
+        num_registers=config.num_registers,
+        attention_type=config.standard_eval_attention,
+    ).to(config.device)
+    std_model_slow.load_state_dict(
+        torch.load("outputs/standard_weights.pt", weights_only=True)
     )
 
-# Evaluation
-print("Loading saved weights into SLOW models for evaluation and visualization...")
-
-std_model_slow = CausalLM(
-    vocab_size=vocab_size,
-    num_layers=config.num_layers,
-    d_model=config.emb_dim,
-    num_heads=config.num_heads,
-    max_seq_len=config.max_seq_len,
-    pos_emb_type=config.pos_emb_type,
-    num_registers=config.num_registers,
-    attention_type=config.standard_eval_attention,
-).to(config.device)
-std_model_slow.load_state_dict(
-    torch.load("outputs/standard_weights.pt", weights_only=True)
-)
-
-rbf_model_slow = CausalLM(
-    vocab_size=vocab_size,
-    num_layers=config.num_layers,
-    d_model=config.emb_dim,
-    num_heads=config.num_heads,
-    max_seq_len=config.max_seq_len,
-    pos_emb_type=config.pos_emb_type,
-    num_registers=config.num_registers,
-    attention_type=config.rbf_eval_attention,
-).to(config.device)
-rbf_model_slow.load_state_dict(torch.load("outputs/rbf_weights.pt", weights_only=True))
-
-# 3. Generate Stories (Using Slow Models)
-print(
-    "Standard Attention (Slow Eval):",
-    generate_story(std_model_slow, tokenizer, config.prompt, config=config),
-    end="\n\n",
-)
-print(
-    "RBF Attention (Slow Eval):",
-    generate_story(rbf_model_slow, tokenizer, config.prompt, config=config),
-    end="\n\n",
-)
-
-# 4. Visualize Attention (Using Slow Models)
-visualize_attention_hf(
-    std_model_slow,
-    tokenizer,
-    config.prompt,
-    config,
-    save_path="outputs/standard_attention.png",
-)
-visualize_attention_hf(
-    rbf_model_slow,
-    tokenizer,
-    config.prompt,
-    config,
-    save_path="outputs/rbf_attention.png",
-)
-
-# 5. Plot Loss
-if config.train_rbf and config.train_standard:
-    plt.figure(figsize=(10, 6))
-    plt.plot(
-        std_train_steps,
-        std_train_loss,
-        label="Standard Train Loss",
-        color="blue",
-        linestyle="-",
+    rbf_model_slow = CausalLM(
+        vocab_size=vocab_size,
+        num_layers=config.num_layers,
+        d_model=config.emb_dim,
+        num_heads=config.num_heads,
+        max_seq_len=config.max_seq_len,
+        pos_emb_type=config.pos_emb_type,
+        num_registers=config.num_registers,
+        attention_type=config.rbf_eval_attention,
+    ).to(config.device)
+    rbf_model_slow.load_state_dict(
+        torch.load("outputs/rbf_weights.pt", weights_only=True)
     )
-    plt.plot(
-        std_val_steps,
-        std_val_loss,
-        label="Standard Val Loss",
-        color="blue",
-        linestyle="--",
+
+    # 3. Generate Stories (Using Slow Models)
+    print(
+        "Standard Attention (Slow Eval):",
+        generate_story(std_model_slow, tokenizer, config.prompt, config=config),
+        end="\n\n",
     )
-    plt.plot(
-        rbf_train_steps,
-        rbf_train_loss,
-        label="RBF Train Loss",
-        color="orange",
-        linestyle="-",
+    print(
+        "RBF Attention (Slow Eval):",
+        generate_story(rbf_model_slow, tokenizer, config.prompt, config=config),
+        end="\n\n",
     )
-    plt.plot(
-        rbf_val_steps,
-        rbf_val_loss,
-        label="RBF Val Loss",
-        color="orange",
-        linestyle="--",
+
+    # 4. Visualize Attention (Using Slow Models)
+    visualize_attention_hf(
+        std_model_slow,
+        tokenizer,
+        config.prompt,
+        config,
+        save_path="outputs/standard_attention.png",
     )
-    plt.xlabel("Steps")
-    plt.ylabel("Loss")
-    plt.title("Training and Validation Loss Comparison")
-    plt.legend()
-    plt.grid(True)
-    plt.savefig("outputs/loss_plot.png", bbox_inches="tight")
-    plt.close()
+    visualize_attention_hf(
+        rbf_model_slow,
+        tokenizer,
+        config.prompt,
+        config,
+        save_path="outputs/rbf_attention.png",
+    )
+
+    # 5. Plot Loss
+    if config.train_rbf and config.train_standard:
+        plt.figure(figsize=(10, 6))
+        plt.plot(
+            std_train_steps,
+            std_train_loss,
+            label="Standard Train Loss",
+            color="blue",
+            linestyle="-",
+        )
+        plt.plot(
+            std_val_steps,
+            std_val_loss,
+            label="Standard Val Loss",
+            color="blue",
+            linestyle="--",
+        )
+        plt.plot(
+            rbf_train_steps,
+            rbf_train_loss,
+            label="RBF Train Loss",
+            color="orange",
+            linestyle="-",
+        )
+        plt.plot(
+            rbf_val_steps,
+            rbf_val_loss,
+            label="RBF Val Loss",
+            color="orange",
+            linestyle="--",
+        )
+        plt.xlabel("Steps")
+        plt.ylabel("Loss")
+        plt.title("Training and Validation Loss Comparison")
+        plt.legend()
+        plt.grid(True)
+        plt.savefig("outputs/loss_plot.png", bbox_inches="tight")
+        plt.close()
+
+
+if __name__ == "__main__":
+    main()
