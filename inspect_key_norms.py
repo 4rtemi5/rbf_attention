@@ -35,7 +35,7 @@ def main():
         max_seq_len=config.max_seq_len,
         pos_emb_type=config.pos_emb_type,
         num_registers=config.num_registers,
-        attention_type=config.standard_training_attention,
+        attention_type="standard",
     ).to(config.device)
     std_model.load_state_dict(
         torch.load("outputs/standard_weights.pt", weights_only=True)
@@ -50,7 +50,7 @@ def main():
         max_seq_len=config.max_seq_len,
         pos_emb_type=config.pos_emb_type,
         num_registers=config.num_registers,
-        attention_type=config.rbf_training_attention,
+        attention_type=config.rbf_eval_attention,
     ).to(config.device)
     rbf_model.load_state_dict(torch.load("outputs/rbf_weights.pt", weights_only=True))
     rbf_model.eval()
@@ -67,13 +67,13 @@ def main():
         std_k_norms.append(norms)
         return original_sdpa(q, k, v, *args, **kwargs)
 
-    original_rbf = rbf_attention.TritonScaledRBFAttention.apply
+    original_rbf = rbf_attention.compute_rbf_logits
 
-    def hooked_rbf(q, k, v, is_causal):
+    def hooked_rbf(q, k):
         # Calculate L2 norm along the head dimension
         norms = k.norm(dim=-1).detach().cpu().flatten()
         rbf_k_norms.append(norms)
-        return original_rbf(q, k, v, is_causal)
+        return original_rbf(q, k)
 
     # 4. Run Evaluation to Collect Distributions
     print("Extracting Key magnitudes over the validation set...")
@@ -86,9 +86,7 @@ def main():
                 "torch.nn.functional.scaled_dot_product_attention",
                 side_effect=hooked_sdpa,
             ),
-            patch(
-                "rbf_attention.TritonScaledRBFAttention.apply", side_effect=hooked_rbf
-            ),
+            patch("rbf_attention.compute_rbf_logits", side_effect=hooked_rbf),
         ):
             for i, batch in enumerate(val_loader):
                 if i >= num_batches_to_sample:

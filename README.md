@@ -74,7 +74,7 @@ python test_equivalence.py
 python rbf_math_test.py
 
 # run triton benchmarks
-python profile_attention.py
+python rbf_attention.py
 
 # train and compare standard vs rbf models
 python train_rbf_transformer.py
