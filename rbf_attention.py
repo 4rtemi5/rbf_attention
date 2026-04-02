@@ -1293,6 +1293,7 @@ def _causal_mask_fn(b, h, q_idx, k_idx):
 
 
 def rbf_flex_attention(q, k, v, is_causal=True):
+    q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
     b, h, s, d = q.shape
     sm_scale = 1.0 / (d**0.5)
 
