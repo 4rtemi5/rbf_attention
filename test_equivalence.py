@@ -3,10 +3,10 @@ import math
 import torch
 import torch.nn.functional as F
 
-from rbf_attention import TritonScaledRBFAttention
+from rbf_attention import TritonScaledRBFAttention, rbf_flex_attention
 
 
-def rbf_math_forward(q, k, v):
+def rbf_math_forward(q, k, v, is_causal=True):
     """
     Extracts the PyTorch-native math version from your CustomCausalAttention class
     so we can test it directly on Q, K, V tensors without the projection layers.
@@ -27,7 +27,7 @@ def rbf_math_forward(q, k, v):
 
     # Use PyTorch's native SDPA for the baseline
     out = F.scaled_dot_product_attention(
-        q_prime, k_prime, v, is_causal=True, scale=scale
+        q_prime, k_prime, v, is_causal=is_causal, scale=scale
     )
     return out
 
@@ -48,7 +48,7 @@ def run_equivalence_test(dtype=torch.float16):
     DTYPE = dtype
 
     print(
-        f"Testing Equivalence -> B={BATCH}, H={HEADS}, SEQ={SEQ_LEN}, DIM={HEAD_DIM}, DTYPE={DTYPE}\n"
+        f"\nTesting Equivalence -> B={BATCH}, H={HEADS}, SEQ={SEQ_LEN}, DIM={HEAD_DIM}, DTYPE={DTYPE}"
     )
 
     # 1. Initialize identical tensors for the Math Baseline
@@ -63,44 +63,67 @@ def run_equivalence_test(dtype=torch.float16):
     k_triton = k_math.clone().detach().requires_grad_(True)
     v_triton = v_math.clone().detach().requires_grad_(True)
 
-    # 3. Create a random upstream gradient to simulate backpropagation
+    # 3. Clone tensors for the Flex Attention version (to keep gradients isolated)
+    q_flex = q_math.clone().detach().requires_grad_(True)
+    k_flex = k_math.clone().detach().requires_grad_(True)
+    v_flex = v_math.clone().detach().requires_grad_(True)
+
+    # 4. Create a random upstream gradient to simulate backpropagation
     dout = torch.randn_like(q_math)
 
     # ==========================================
     # FORWARD PASS
     # ==========================================
-    out_math = rbf_math_forward(q_math, k_math, v_math)
+    out_math = rbf_math_forward(q_math, k_math, v_math, is_causal=True)
     out_triton = TritonScaledRBFAttention.apply(q_triton, k_triton, v_triton, True)
+    out_flex = torch.compile(rbf_flex_attention)(q_flex, k_flex, v_flex, is_causal=True)
 
     # ==========================================
     # BACKWARD PASS
     # ==========================================
     out_math.backward(dout)
     out_triton.backward(dout)
+    out_flex.backward(dout)
 
     # ==========================================
     # COMPARISON
     # ==========================================
-    def compare_tensors(name, t1, t2, atol=None, rtol=1e-3):
+    def compare_tensors(name, t_math, t_triton, t_flex, atol=None, rtol=1e-3):
         if atol is None:
-            atol = 3e-2 if t1.dtype == torch.float32 else 1e-2
-        # Calculate maximum absolute difference
-        max_diff = (t1 - t2).abs().max().item()
+            atol = 3e-2 if t_math.dtype == torch.float32 else 1e-2
 
-        # Check if they are close within tolerances
-        is_close = torch.allclose(t1, t2, atol=atol, rtol=rtol)
+        # Calculate maximum absolute differences against the math baseline
+        diff_triton = (t_math - t_triton).abs().max().item()
+        diff_flex = (t_math - t_flex).abs().max().item()
 
-        status = "✅ PASS" if is_close else "❌ FAIL"
-        print(f"{name:<10} | {status} | Max Diff: {max_diff:.6f}")
-        return is_close
+        # Check tolerances
+        is_close_triton = torch.allclose(t_math, t_triton, atol=atol, rtol=rtol)
+        is_close_flex = torch.allclose(t_math, t_flex, atol=atol, rtol=rtol)
+
+        status_triton = "✅ PASS" if is_close_triton else "❌ FAIL"
+        status_flex = "✅ PASS" if is_close_flex else "❌ FAIL"
+
+        # Format rows with clear columns for both Triton and Flex
+        print(
+            f"{name:<7} | {status_triton} (Max Diff: {diff_triton:.6f}) | {status_flex} (Max Diff: {diff_flex:.6f})"
+        )
+        return is_close_triton, is_close_flex
+
+    # Print Table Headers
+    print(f"\n{'-' * 75}")
+    print(
+        f"{'Tensor':<7} | {'Triton vs Math Baseline':<29} | {'Flex vs Math Baseline':<29}"
+    )
+    print(f"{'-' * 75}")
 
     print("--- Forward Pass ---")
-    compare_tensors("Output", out_math, out_triton)
+    compare_tensors("Output", out_math, out_triton, out_flex)
 
     print("\n--- Backward Pass (Gradients) ---")
-    compare_tensors("dQ", q_math.grad, q_triton.grad)
-    compare_tensors("dK", k_math.grad, k_triton.grad)
-    compare_tensors("dV", v_math.grad, v_triton.grad)
+    compare_tensors("dQ", q_math.grad, q_triton.grad, q_flex.grad)
+    compare_tensors("dK", k_math.grad, k_triton.grad, k_flex.grad)
+    compare_tensors("dV", v_math.grad, v_triton.grad, v_flex.grad)
+    print(f"{'-' * 75}")
 
 
 if __name__ == "__main__":

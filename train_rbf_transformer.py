@@ -42,7 +42,7 @@ class TrainingConfig:
     warmup_steps: int = 1000
     use_amp: bool = torch.cuda.is_available()
     standard_training_attention: str = "standard"
-    rbf_training_attention: str = "rbf"
+    rbf_training_attention: str = "rbf_flex"
 
     # use slow variants for evaluation to be able to output attention maps
     standard_eval_attention: str = "standard_slow"

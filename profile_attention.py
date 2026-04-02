@@ -1,9 +1,11 @@
 import math
+import os
 
 import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 import triton
+from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
 from rbf_attention import (
     TritonScaledRBFAttention,
@@ -30,10 +32,25 @@ def rbf_math_forward(q, k, v):
         q_prime = F.pad(q_prime, (0, pad_len))
         k_prime = F.pad(k_prime, (0, pad_len))
 
+    # [FIX 1]: Pad `v` to perfectly match `q_prime` and `k_prime`'s final dimension.
+    # Mismatched dimensions force SDPA to drop out of FlashAttention
+    # and use the notoriously slow Math backend.
+    v_pad_len = q_prime.shape[-1] - v.shape[-1]
+    if v_pad_len > 0:
+        v_prime = F.pad(v, (0, v_pad_len))
+    else:
+        v_prime = v
+
     scale = 2.0 / math.sqrt(q.size(-1))
-    return F.scaled_dot_product_attention(
-        q_prime, k_prime, v, is_causal=True, scale=scale
+    out = F.scaled_dot_product_attention(
+        q_prime, k_prime, v_prime, is_causal=True, scale=scale
     )
+
+    # Strip the padding off the value dimension of the outputs
+    if v_pad_len > 0:
+        out = out[..., :-v_pad_len]
+
+    return out
 
 
 def rbf_non_softmax_math_forward(q, k, v):
@@ -55,13 +72,62 @@ def rbf_non_softmax_math_forward(q, k, v):
     return p @ v
 
 
+# [FIX 2]: Globally cache Flex-Attention's block mask.
+# Continuously redefining `causal_mask` inside the function causes cache misses,
+# making `create_block_mask` run synchronously on the CPU every forward pass.
+_FLEX_MASK_CACHE = {}
+
+
+def causal_mask_fn(b, h, q_idx, k_idx):
+    return q_idx >= k_idx
+
+
+def rbf_flex_attention(q, k, v, is_causal=True):
+    b, h, s, d = q.shape
+    sm_scale = 1.0 / (d**0.5)
+
+    k_sq_scaled = k.pow(2).sum(dim=-1) * sm_scale
+
+    def rbf_score_mod(score, b, h, q_idx, k_idx):
+        return (2.0 * score) - k_sq_scaled[b, h, k_idx]
+
+    block_mask = None
+    if is_causal:
+        key = (s, q.device)
+        if key not in _FLEX_MASK_CACHE:
+            # B=None, H=None natively broadcasts the mask across batches and heads
+            _FLEX_MASK_CACHE[key] = create_block_mask(
+                causal_mask_fn, B=None, H=None, Q_LEN=s, KV_LEN=s, device=q.device.type
+            )
+        block_mask = _FLEX_MASK_CACHE[key]
+
+    return flex_attention(q, k, v, score_mod=rbf_score_mod, block_mask=block_mask)
+
+
 def profile_memory(func, *args, **kwargs):
-    """Measures peak VRAM usage of a function call."""
+    """Measures strictly the peak incremental VRAM usage triggered by a function call."""
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
-    _ = func(*args, **kwargs)
-    peak_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
+
+    # [FIX 3]: Track base memory prior to execution. We subtract this from the peak
+    # to isolate true algorithm footprint from the pre-allocated input tensors.
+    base_mem = torch.cuda.memory_allocated()
+    out = func(*args, **kwargs)
+    peak_mb = (torch.cuda.max_memory_allocated() - base_mem) / (1024 * 1024)
+
+    del out  # Safely clear the graph out of scope
     return peak_mb
+
+
+# ==========================================
+# Wrappers for Compilation
+# ==========================================
+def run_sdpa(q, k, v):
+    return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
+
+def run_triton_rbf(q, k, v):
+    return TritonScaledRBFAttention.apply(q, k, v, True)
 
 
 def run_benchmarks():
@@ -70,20 +136,34 @@ def run_benchmarks():
         f"Fixed Dimensions: BATCH={BATCH_SIZE}, HEADS={NUM_HEADS}, HEAD_DIM={HEAD_DIM}\n"
     )
     print(
-        f"{'Seq Len':<10} | {'Method':<15} | {'Fwd (ms)':<10} | {'Bwd (ms)':<10} | {'Peak VRAM (MB)':<15}"
+        f"{'Seq Len':<10} | {'Method':<25} | {'Fwd (ms)':<10} | {'Bwd (ms)':<10} | {'Peak VRAM (MB)':<15}"
     )
-    print("-" * 65)
+    print("-" * 80)
 
     results = {
         "SDPA Baseline": {"fwd": [], "bwd": [], "mem": []},
-        "Naiive RBF Math": {"fwd": [], "bwd": [], "mem": []},
+        "Naive RBF Math": {"fwd": [], "bwd": [], "mem": []},
         "RBF Triton": {"fwd": [], "bwd": [], "mem": []},
-        # "Non-Softmax Math": {"fwd": [], "bwd": [], "mem": []},
-        # "Non-Softmax Triton": {"fwd": [], "bwd": [], "mem": []},
+        "RBF Flex-Attention": {"fwd": [], "bwd": [], "mem": []},
     }
 
     for seq_len in SEQ_LENS:
-        # 1. Initialize Tensors
+        # Reset Dynamo cache to prevent dynamic shape generalization
+        torch._dynamo.reset()
+
+        # Compile FRESH for strictly static shapes
+        compiled_sdpa = torch.compile(run_sdpa)
+        compiled_naive = torch.compile(rbf_math_forward)
+        compiled_triton = torch.compile(run_triton_rbf)
+        compiled_flex = torch.compile(rbf_flex_attention)
+
+        methods = [
+            ("SDPA Baseline", compiled_sdpa),
+            ("Naive RBF Math", compiled_naive),
+            ("RBF Triton", compiled_triton),
+            ("RBF Flex-Attention", compiled_flex),
+        ]
+
         q = torch.randn(
             BATCH_SIZE,
             NUM_HEADS,
@@ -113,72 +193,73 @@ def run_benchmarks():
         )
         dout = torch.randn_like(q)
 
-        methods = [
-            (
-                "SDPA Baseline",
-                lambda: F.scaled_dot_product_attention(q, k, v, is_causal=True),
-            ),
-            ("Naiive RBF Math", lambda: rbf_math_forward(q, k, v)),
-            ("RBF Triton", lambda: TritonScaledRBFAttention.apply(q, k, v, True)),
-            # ("Non-Softmax Math", lambda: rbf_non_softmax_math_forward(q, k, v)),
-            # (
-            #     "Non-Softmax Triton",
-            #     lambda: TritonNonSoftmaxRBFAttention.apply(q, k, v, True),
-            # ),
-        ]
-
-        for name, fn in methods:
+        for name, compiled_fn in methods:
             try:
-                # Clear grads
-                q.grad, k.grad, v.grad = None, None, None
+                # WARMUP
+                for _ in range(3):
+                    q.grad, k.grad, v.grad = None, None, None
+                    out = compiled_fn(q, k, v)
+                    out.backward(dout)
+
+                torch.cuda.empty_cache()
 
                 # Measure Forward Time
-                fwd_ms = triton.testing.do_bench(fn, quantiles=None)
-
-                # Measure Memory (Forward only to isolate materialization footprint)
-                mem_mb = profile_memory(fn)
-
-                # Measure Backward Time
-                out = fn()
-                bwd_ms = triton.testing.do_bench(
-                    lambda: out.backward(dout, retain_graph=True),  # noqa: F821
-                    quantiles=None,
+                fwd_ms = triton.testing.do_bench(
+                    lambda: compiled_fn(q, k, v), quantiles=None
                 )
 
-                del out
+                # Measure Memory Overhead
+                q.grad, k.grad, v.grad = None, None, None
+                mem_mb = profile_memory(compiled_fn, q, k, v)
+
+                # Measure Forward + Backward Time
+                def fwd_bwd():
+                    out_bwd = compiled_fn(q, k, v)
+                    out_bwd.backward(dout)
+
+                # [FIX 4]: Pass grad_to_none explicitly. Removes python overhead from the
+                # benchmarking timing event block while securely preventing memory leaks.
+                fwd_bwd_ms = triton.testing.do_bench(
+                    fwd_bwd, quantiles=None, grad_to_none=[q, k, v]
+                )
+
+                # Derive Backward by cleanly subtracting Forward
+                bwd_ms = fwd_bwd_ms - fwd_ms
+
                 torch.cuda.empty_cache()
 
                 print(
-                    f"{seq_len:<10} | {name:<15} | {fwd_ms:<10.3f} | {bwd_ms:<10.3f} | {mem_mb:<15.2f}"
+                    f"{seq_len:<10} | {name:<25} | {fwd_ms:<10.3f} | {bwd_ms:<10.3f} | {mem_mb:<15.2f}"
                 )
 
                 results[name]["fwd"].append(fwd_ms)
                 results[name]["bwd"].append(bwd_ms)
                 results[name]["mem"].append(mem_mb)
 
-            except RuntimeError:
-                # Catch OOM errors for math version at high sequence lengths
+            except Exception as e:
                 print(
-                    f"{seq_len:<10} | {name:<15} | {'OOM':<10} | {'OOM':<10} | {'OOM':<15}"
+                    f"{seq_len:<10} | {name:<25} | {'ERROR':<10} | {'ERROR':<10} | {'ERROR':<15}"
                 )
+                print(f"   -> {type(e).__name__}: {str(e)[:100]}...")
+
                 results[name]["fwd"].append(float("nan"))
                 results[name]["bwd"].append(float("nan"))
                 results[name]["mem"].append(float("nan"))
-
-                # Cleanup in case of OOM
                 torch.cuda.empty_cache()
 
-        print("-" * 65)
+        print("-" * 80)
 
     return results
 
 
 def plot_results(results, filename="attention_profiling_results.png"):
+    os.makedirs("outputs", exist_ok=True)
+
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
     metrics = [
         ("fwd", "Forward Time (ms)"),
         ("bwd", "Backward Time (ms)"),
-        ("mem", "Peak VRAM (MB)"),
+        ("mem", "Peak Forward Activations (MB)"),
     ]
 
     for ax, (metric_key, title) in zip(axes, metrics):
@@ -192,8 +273,9 @@ def plot_results(results, filename="attention_profiling_results.png"):
         ax.legend()
 
     plt.tight_layout()
-    plt.savefig(f"outputs/{filename}")
-    print(f"\nSaved benchmark plots to 'outputs/{filename}'")
+    filepath = os.path.join("outputs", filename)
+    plt.savefig(filepath)
+    print(f"\nSaved benchmark plots to '{filepath}'")
 
 
 if __name__ == "__main__":

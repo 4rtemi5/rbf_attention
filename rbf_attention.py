@@ -6,6 +6,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 from einops import rearrange
+from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
 
 def _get_autotune_configs():
@@ -20,10 +21,12 @@ def _get_autotune_configs():
     ]
 
 
-@triton.autotune(
-    configs=_get_autotune_configs(),
-    key=["N_CTX", "D_HEAD"],
-)
+# =========================================================================
+# TRITON KERNELS
+# =========================================================================
+
+
+@triton.autotune(configs=_get_autotune_configs(), key=["N_CTX", "D_HEAD"])
 @triton.jit
 def _rbf_attn_fwd_kernel(
     Q,
@@ -123,14 +126,11 @@ def _rbf_attn_fwd_kernel(
 
         k_f32 = k.to(tl.float32)
         k_sq = tl.sum(k_f32 * k_f32, axis=1)
-
-        # Exact PyTorch SDPA testing matching (FP16 k_sq truncation explicitly enforced)
         k_sq_f16 = k_sq.to(K.dtype.element_ty).to(tl.float32)
 
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         qk += tl.dot(q, tl.trans(k))
 
-        # Exact matching with PyTorch SDPA scaling sequence
         logits = (qk - 0.5 * k_sq_f16[None, :]) * (2.0 * sm_scale)
 
         if IS_CAUSAL and start_m * BLOCK_M < start_n_idx + BLOCK_N:
@@ -217,13 +217,7 @@ def _bwd_preprocess(
     tl.store(Delta + off_hz * N_CTX + offs_m, delta.to(tl.float32), mask=offs_m < N_CTX)
 
 
-# =========================================================================
-# FA2 BACKWARD KERNEL 1: Accumulate dK and dV cleanly (Threadblock over Keys)
-# =========================================================================
-@triton.autotune(
-    configs=_get_autotune_configs(),
-    key=["N_CTX", "D_HEAD"],
-)
+@triton.autotune(configs=_get_autotune_configs(), key=["N_CTX", "D_HEAD"])
 @triton.jit
 def _rbf_attn_bwd_dk_dv_kernel(
     Q,
@@ -292,7 +286,6 @@ def _rbf_attn_bwd_dk_dv_kernel(
     k_sq = tl.sum(k_f32 * k_f32, axis=1)
     k_sq_f16 = k_sq.to(K.dtype.element_ty).to(tl.float32)
 
-    # [OPTIMIZATION] Setup pure accumulators completely outside the loop
     dk_dot = tl.zeros([BLOCK_N, BLOCK_DMODEL], dtype=tl.float32)
     ds_scaled_sum_k_acc = tl.zeros([BLOCK_N], dtype=tl.float32)
     dv = tl.zeros([BLOCK_N, BLOCK_DMODEL], dtype=tl.float32)
@@ -362,11 +355,9 @@ def _rbf_attn_bwd_dk_dv_kernel(
         d_logits = p * (dp - delta[:, None])
         ds_scaled = (d_logits * (2.0 * sm_scale)).to(tl.float32)
 
-        # [OPTIMIZATION] Maintain clean Tensor Core instructions
         ds_scaled_sum_k_acc += tl.sum(ds_scaled, axis=0)
         dk_dot += tl.dot(tl.trans(ds_scaled).to(Q.dtype.element_ty), q)
 
-    # [OPTIMIZATION] Apply vector scaling EXACTLY ONCE outside the loop
     dk = dk_dot - ds_scaled_sum_k_acc[:, None] * k_f32
 
     dk_ptrs = (
@@ -395,13 +386,7 @@ def _rbf_attn_bwd_dk_dv_kernel(
     )
 
 
-# =========================================================================
-# FA2 BACKWARD KERNEL 2: Accumulate dQ cleanly (Threadblock over Queries)
-# =========================================================================
-@triton.autotune(
-    configs=_get_autotune_configs(),
-    key=["N_CTX", "D_HEAD"],
-)
+@triton.autotune(configs=_get_autotune_configs(), key=["N_CTX", "D_HEAD"])
 @triton.jit
 def _rbf_attn_bwd_dq_kernel(
     Q,
@@ -510,15 +495,16 @@ def _rbf_attn_bwd_dq_kernel(
         qk += tl.dot(q, tl.trans(k))
         logits = (qk - 0.5 * k_sq_f16[None, :]) * (2.0 * sm_scale)
 
-        if IS_CAUSAL:
+        if IS_CAUSAL and start_m_idx < start_n_idx + BLOCK_N:
             logits = tl.where(
                 offs_m[:, None] >= curr_offs_n[None, :], logits, float("-inf")
             )
-        logits = tl.where(
-            (offs_m[:, None] < N_CTX) & (curr_offs_n[None, :] < N_CTX),
-            logits,
-            float("-inf"),
-        )
+        if start_m_idx + BLOCK_M > N_CTX or start_n_idx + BLOCK_N > N_CTX:
+            logits = tl.where(
+                (offs_m[:, None] < N_CTX) & (curr_offs_n[None, :] < N_CTX),
+                logits,
+                float("-inf"),
+            )
 
         logits = logits.to(tl.float32)
         p = tl.math.exp(logits - l_i[:, None])
@@ -624,7 +610,6 @@ class TritonScaledRBFAttention(torch.autograd.Function):
 
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
 
-        # Launch distinct kernels across their respective parallelization dimensions to bypass atomics
         grid_dk_dv = lambda meta: (triton.cdiv(N_CTX, meta["BLOCK_N"]), B * H, 1)
         _rbf_attn_bwd_dk_dv_kernel[grid_dk_dv](
             q,
@@ -688,10 +673,7 @@ class TritonScaledRBFAttention(torch.autograd.Function):
         return dq, dk, dv, None
 
 
-@triton.autotune(
-    configs=_get_autotune_configs(),
-    key=["N_CTX", "D_HEAD"],
-)
+@triton.autotune(configs=_get_autotune_configs(), key=["N_CTX", "D_HEAD"])
 @triton.jit
 def _rbf_non_softmax_fwd_kernel(
     Q,
@@ -752,7 +734,6 @@ def _rbf_non_softmax_fwd_kernel(
         q_ptrs, mask=(offs_m[:, None] < N_CTX) & (offs_d[None, :] < D_HEAD), other=0.0
     )
 
-    # PRE-COMPUTE scaled Q norm to fixe numerical instability while preserving performance
     q_f32 = q.to(tl.float32)
     q_sq_scaled = tl.sum(q_f32 * q_f32, axis=1) * sm_scale
     sm_scale_x2 = 2.0 * sm_scale
@@ -762,7 +743,6 @@ def _rbf_non_softmax_fwd_kernel(
     lo = 0
     hi = tl.minimum(N_CTX, (start_m + 1) * BLOCK_M) if IS_CAUSAL else N_CTX
 
-    # Set pointer bases cleanly outside the loop
     k_ptrs = (
         K
         + off_z * stride_kz
@@ -782,7 +762,6 @@ def _rbf_non_softmax_fwd_kernel(
         start_n_idx = tl.multiple_of(start_n, BLOCK_N)
         curr_offs_n = start_n_idx + offs_n
 
-        # Fast 1D scalar pointer advancements
         k = tl.load(
             k_ptrs + start_n_idx * stride_kn,
             mask=(curr_offs_n[:, None] < N_CTX) & (offs_d[None, :] < D_HEAD),
@@ -794,14 +773,12 @@ def _rbf_non_softmax_fwd_kernel(
             other=0.0,
         )
 
-        # PRE-COMPUTE scaled K norm
         k_f32 = k.to(tl.float32)
         k_sq_scaled = tl.sum(k_f32 * k_f32, axis=1) * sm_scale
 
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         qk += tl.dot(q, tl.trans(k))
 
-        # Fused Logits (Inherently bounds <= 0, protecting against exp() fp32 overflow limits)
         logits = qk * sm_scale_x2 - q_sq_scaled[:, None] - k_sq_scaled[None, :]
 
         if IS_CAUSAL and start_m * BLOCK_M < start_n_idx + BLOCK_N:
@@ -825,10 +802,7 @@ def _rbf_non_softmax_fwd_kernel(
     )
 
 
-@triton.autotune(
-    configs=_get_autotune_configs(),
-    key=["N_CTX", "D_HEAD"],
-)
+@triton.autotune(configs=_get_autotune_configs(), key=["N_CTX", "D_HEAD"])
 @triton.jit
 def _rbf_non_softmax_bwd_dk_dv_kernel(
     Q,
@@ -895,14 +869,12 @@ def _rbf_non_softmax_bwd_dk_dv_kernel(
     k_sq_scaled = tl.sum(k_f32 * k_f32, axis=1) * sm_scale
     sm_scale_x2 = 2.0 * sm_scale
 
-    # Setup pure accumulators completely outside the loop
     dk_dot = tl.zeros([BLOCK_N, BLOCK_DMODEL], dtype=tl.float32)
     S_colsum_acc = tl.zeros([BLOCK_N], dtype=tl.float32)
     dv = tl.zeros([BLOCK_N, BLOCK_DMODEL], dtype=tl.float32)
 
     lo = (start_n_idx // BLOCK_M) * BLOCK_M if IS_CAUSAL else 0
 
-    # Set pointer bases cleanly outside the loop
     q_ptrs = (
         Q
         + off_z * stride_qz
@@ -962,11 +934,9 @@ def _rbf_non_softmax_bwd_dk_dv_kernel(
 
         S = (p * dp * (-sm_scale_x2)).to(tl.float32)
 
-        # Tensor core accumulation inside loop
         S_colsum_acc += tl.sum(S, axis=0)
         dk_dot += tl.dot(tl.trans(S).to(Q.dtype.element_ty), q)
 
-    # Apply mathematical hoist ONCE
     dk = S_colsum_acc[:, None] * k_f32 - dk_dot
 
     dk_ptrs = (
@@ -996,10 +966,7 @@ def _rbf_non_softmax_bwd_dk_dv_kernel(
     )
 
 
-@triton.autotune(
-    configs=_get_autotune_configs(),
-    key=["N_CTX", "D_HEAD"],
-)
+@triton.autotune(configs=_get_autotune_configs(), key=["N_CTX", "D_HEAD"])
 @triton.jit
 def _rbf_non_softmax_bwd_dq_kernel(
     Q,
@@ -1065,13 +1032,11 @@ def _rbf_non_softmax_bwd_dq_kernel(
     q_sq_scaled = tl.sum(q_f32 * q_f32, axis=1) * sm_scale
     sm_scale_x2 = 2.0 * sm_scale
 
-    # Pure accumulators completely outside the loop
     dq_dot = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
     S_rowsum_acc = tl.zeros([BLOCK_M], dtype=tl.float32)
 
     hi = tl.minimum(N_CTX, start_m_idx + BLOCK_M) if IS_CAUSAL else N_CTX
 
-    # Set pointer bases outside the loop
     k_ptrs = (
         K
         + off_z * stride_kz
@@ -1110,7 +1075,6 @@ def _rbf_non_softmax_bwd_dq_kernel(
 
         logits = qk * sm_scale_x2 - q_sq_scaled[:, None] - k_sq_scaled[None, :]
 
-        # Boundary tracking directly mirrored from dK_dV logic.
         if IS_CAUSAL and start_m_idx < start_n_idx + BLOCK_N:
             logits = tl.where(
                 offs_m[:, None] >= curr_offs_n[None, :], logits, float("-inf")
@@ -1129,11 +1093,9 @@ def _rbf_non_softmax_bwd_dq_kernel(
 
         S = (p * dp * (-sm_scale_x2)).to(tl.float32)
 
-        # Pure tensor core accumulation inside loop
         S_rowsum_acc += tl.sum(S, axis=1)
         dq_dot += tl.dot(S.to(K.dtype.element_ty), k)
 
-    # Apply mathematical hoist outside the loop
     dq = S_rowsum_acc[:, None] * q_f32 - dq_dot
 
     dq_ptrs = (
@@ -1264,31 +1226,28 @@ class TritonNonSoftmaxRBFAttention(torch.autograd.Function):
         return dq, dk, dv, None
 
 
+# =========================================================================
+# UTILITIES & POSITIONAL ENCODINGS
+# =========================================================================
+
+
 def precompute_freqs_cis(dim, end, theta=10000.0):
-    """Precomputes the frequency tensor for RoPE."""
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
     t = torch.arange(end, device=freqs.device)
     freqs = torch.outer(t, freqs).float()
-    # Duplicate the frequencies to match the head dimension
     freqs = torch.cat((freqs, freqs), dim=-1)
-
-    cos = torch.cos(freqs)
-    sin = torch.sin(freqs)
+    cos, sin = torch.cos(freqs), torch.sin(freqs)
     return cos, sin
 
 
 def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
     x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
 
 def apply_rotary_pos_emb(q, k, cos, sin):
-    """Applies Rotary Position Embedding to q and k."""
-    # Reshape cos and sin to broadcast with q and k: [batch, heads, seq_len, head_dim]
     cos = cos.unsqueeze(0).unsqueeze(0)
     sin = sin.unsqueeze(0).unsqueeze(0)
-
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed.type_as(q), k_embed.type_as(k)
@@ -1302,11 +1261,57 @@ def get_unrotated_sinusoids(seq_len, dim, device, theta=10000.0):
 
 
 def compute_rbf_logits(q, k):
-    q_sq = q.pow(2).sum(dim=-1, keepdim=True)
-    k_sq = k.pow(2).sum(dim=-1).unsqueeze(-2)
-    dot_product = q @ k.swapaxes(-2, -1)
+    q_f32, k_f32 = q.float(), k.float()
+    q_sq = q_f32.pow(2).sum(dim=-1, keepdim=True)
+    k_sq = k_f32.pow(2).sum(dim=-1).unsqueeze(-2)
+    dot_product = q_f32 @ k_f32.transpose(-2, -1)
+
     dist_sq = q_sq + k_sq - 2.0 * dot_product
-    return -dist_sq / (q.size(-1) ** 0.5)
+    logits = -dist_sq / (q.size(-1) ** 0.5)
+    return logits.to(q.dtype)
+
+
+# Global Caching for the boolean causal masks
+_CAUSAL_MASK_CACHE = {}
+
+
+def get_causal_mask(seq_len, device):
+    key = (seq_len, str(device))
+    if key not in _CAUSAL_MASK_CACHE:
+        _CAUSAL_MASK_CACHE[key] = torch.ones(
+            seq_len, seq_len, device=device, dtype=torch.bool
+        ).triu_(1)
+    return _CAUSAL_MASK_CACHE[key]
+
+
+# Global Caching for the Flex-Attention block masks
+_FLEX_MASK_CACHE = {}
+
+
+def _causal_mask_fn(b, h, q_idx, k_idx):
+    return q_idx >= k_idx
+
+
+def rbf_flex_attention(q, k, v, is_causal=True):
+    b, h, s, d = q.shape
+    sm_scale = 1.0 / (d**0.5)
+
+    # Cast to float prior to scaling to preserve safe accuracy bounds
+    k_sq_scaled = (k.float().pow(2).sum(dim=-1) * sm_scale).to(k.dtype)
+
+    def rbf_score_mod(score, b, h, q_idx, k_idx):
+        return (2.0 * score) - k_sq_scaled[b, h, k_idx]
+
+    block_mask = None
+    if is_causal:
+        key = (s, str(q.device))
+        if key not in _FLEX_MASK_CACHE:
+            _FLEX_MASK_CACHE[key] = create_block_mask(
+                _causal_mask_fn, B=None, H=None, Q_LEN=s, KV_LEN=s, device=str(q.device)
+            )
+        block_mask = _FLEX_MASK_CACHE[key]
+
+    return flex_attention(q, k, v, score_mod=rbf_score_mod, block_mask=block_mask)
 
 
 class CustomCausalAttention(nn.Module):
@@ -1319,16 +1324,18 @@ class CustomCausalAttention(nn.Module):
         attention_type="standard",
         num_registers=0,
     ):
+        super().__init__()
+
         assert attention_type in [
             "standard",
             "standard_slow",
             "rbf_math",
-            "rbf",
+            "rbf_triton",
+            "rbf_flex",
             "rbf_slow",
             "rbf_non_softmax_slow",
             "rbf_non_softmax",
         ], f"Unknown attention type: {attention_type}"
-        super().__init__()
 
         self.num_heads = num_heads
         self.attention_type = attention_type
@@ -1352,19 +1359,15 @@ class CustomCausalAttention(nn.Module):
 
         elif self.positional_encoding_type == "susie":
             self.pos_dim = self.head_dim
-
-            # 2. Learnable scale initialized to 0.5 (allows semantics to dominate early)
             self.pos_weight = nn.Parameter(
                 torch.full((1, num_heads, 1, self.pos_dim // 2), 0.5)
             )
 
-            # 3. Learnable positional embeddings specifically for Registers!
             if self.num_registers > 0:
                 self.reg_pos_emb = nn.Parameter(
                     torch.randn(1, num_heads, self.num_registers, self.pos_dim) * 0.02
                 )
 
-            # 4. Cache text sinusoids to save massive CPU-GPU sync overhead
             susie_cache = get_unrotated_sinusoids(
                 max_seq_len, self.pos_dim, device="cpu"
             )
@@ -1382,16 +1385,13 @@ class CustomCausalAttention(nn.Module):
 
             if self.num_registers > 0:
                 text_len = s - self.num_registers
-
                 pos_emb_seq = self.susie_cache[:text_len].to(
                     device=q.device, dtype=q.dtype
                 )
                 pos_emb_seq = (
                     pos_emb_seq.view(1, 1, text_len, self.pos_dim) * tied_weight
                 )
-
                 pos_emb_reg = self.reg_pos_emb.to(q.dtype)
-
                 pos_emb = torch.cat([pos_emb_reg, pos_emb_seq], dim=2)
             else:
                 pos_emb = self.susie_cache[:s].to(device=q.device, dtype=q.dtype)
@@ -1402,38 +1402,38 @@ class CustomCausalAttention(nn.Module):
 
         elif self.positional_encoding_type == "rope":
             if self.num_registers > 0:
-                q_reg = q[:, :, : self.num_registers, :]
-                k_reg = k[:, :, : self.num_registers, :]
-                q_text = q[:, :, self.num_registers :, :]
-                k_text = k[:, :, self.num_registers :, :]
-
+                q_reg, k_reg = (
+                    q[:, :, : self.num_registers, :],
+                    k[:, :, : self.num_registers, :],
+                )
+                q_text, k_text = (
+                    q[:, :, self.num_registers :, :],
+                    k[:, :, self.num_registers :, :],
+                )
                 text_len = s - self.num_registers
-                cos_seq = self.cos[:text_len, :]
-                sin_seq = self.sin[:text_len, :]
 
-                q_text, k_text = apply_rotary_pos_emb(q_text, k_text, cos_seq, sin_seq)
-
-                q = torch.cat([q_reg, q_text], dim=2)
-                k = torch.cat([k_reg, k_text], dim=2)
+                q_text, k_text = apply_rotary_pos_emb(
+                    q_text, k_text, self.cos[:text_len, :], self.sin[:text_len, :]
+                )
+                q, k = (
+                    torch.cat([q_reg, q_text], dim=2),
+                    torch.cat([k_reg, k_text], dim=2),
+                )
             else:
-                cos_seq = self.cos[:s, :]
-                sin_seq = self.sin[:s, :]
-                q, k = apply_rotary_pos_emb(q, k, cos_seq, sin_seq)
+                q, k = apply_rotary_pos_emb(q, k, self.cos[:s, :], self.sin[:s, :])
 
-        # Standard Attention Routing
         attn_weights = None
 
         if self.attention_type == "standard":
             out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
         elif self.attention_type == "standard_slow":
-            attn_logits = q @ k.transpose(-2, -1)
-            attn_logits = attn_logits / (q.size(-1) ** 0.5)
-            causal_mask = torch.triu(
-                torch.ones(s, s, device=x.device), diagonal=1
-            ).bool()
-            attn_logits = attn_logits.masked_fill(causal_mask, float("-inf"))
-            attn_weights = F.softmax(attn_logits, dim=-1)
+            attn_logits = (q @ k.transpose(-2, -1)) / (q.size(-1) ** 0.5)
+            # Replaced bloated matrix allocations with locally referenced cache views
+            causal_mask = get_causal_mask(s, x.device)
+            attn_weights = F.softmax(
+                attn_logits.masked_fill_(causal_mask, float("-inf")), dim=-1
+            )
             out = attn_weights @ v
 
         elif self.attention_type == "rbf_math":
@@ -1446,37 +1446,47 @@ class CustomCausalAttention(nn.Module):
                 q_prime = F.pad(q_prime, (0, pad_len))
                 k_prime = F.pad(k_prime, (0, pad_len))
 
+            # Synchronously dynamically pad V to identically mimic Q_prime.shape[-1]
+            v_pad_len = q_prime.shape[-1] - v.shape[-1]
+            if v_pad_len > 0:
+                v_prime = F.pad(v, (0, v_pad_len))
+            else:
+                v_prime = v
+
+            # Using q's original dimension for scaling mathematically
             scale = 2.0 / math.sqrt(q.size(-1))
             out = F.scaled_dot_product_attention(
-                q_prime, k_prime, v, is_causal=True, scale=scale
+                q_prime, k_prime, v_prime, is_causal=True, scale=scale
             )
 
-        elif self.attention_type == "rbf":
+            # Splice off the artificial padding from the dimension to restore correctness
+            if v_pad_len > 0:
+                out = out[..., :-v_pad_len]
+
+        elif self.attention_type == "rbf_triton":
             out = TritonScaledRBFAttention.apply(q, k, v, True)
 
         elif self.attention_type == "rbf_slow":
             attn_logits = compute_rbf_logits(q, k)
-            causal_mask = torch.triu(
-                torch.ones(s, s, device=x.device), diagonal=1
-            ).bool()
-            attn_logits = attn_logits.masked_fill(causal_mask, float("-inf"))
-            attn_weights = F.softmax(attn_logits, dim=-1)
+            causal_mask = get_causal_mask(s, x.device)
+            attn_weights = F.softmax(
+                attn_logits.masked_fill_(causal_mask, float("-inf")), dim=-1
+            )
             out = attn_weights @ v
+
+        elif self.attention_type == "rbf_flex":
+            out = rbf_flex_attention(q, k, v, is_causal=True)
 
         elif self.attention_type == "rbf_non_softmax_slow":
             attn_logits = compute_rbf_logits(q, k)
-            causal_mask = torch.triu(
-                torch.ones(s, s, device=x.device), diagonal=1
-            ).bool()
-            attn_logits = attn_logits.masked_fill(causal_mask, float("-inf"))
-            attn_weights = torch.exp(attn_logits)
+            causal_mask = get_causal_mask(s, x.device)
+            attn_weights = torch.exp(
+                attn_logits.masked_fill_(causal_mask, float("-inf"))
+            )
             out = attn_weights @ v
 
         elif self.attention_type == "rbf_non_softmax":
             out = TritonNonSoftmaxRBFAttention.apply(q, k, v, True)
-
-        else:
-            raise ValueError(f"Unknown attention type: {self.attention_type}")
 
         out = rearrange(out, "b h s n -> b s (h n)")
         return self.proj(out), attn_weights
