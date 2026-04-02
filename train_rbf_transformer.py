@@ -365,11 +365,16 @@ def train_variant(
                                 val_mask = val_attention_mask[:, 1:]
                                 val_y[val_mask == 0] = -100
 
-                                val_logits, _ = model(val_x)
-                                val_loss = criterion(
-                                    val_logits.reshape(-1, vocab_size),
-                                    val_y.reshape(-1),
-                                )
+                                with torch.amp.autocast(
+                                    device_type=config.device,
+                                    dtype=torch.float16,
+                                    enabled=config.use_amp,
+                                ):
+                                    val_logits, _ = model(val_x)
+                                    val_loss = criterion(
+                                        val_logits.reshape(-1, vocab_size),
+                                        val_y.reshape(-1),
+                                    )
                                 total_val_loss += val_loss.item()
 
                         t = time.time() - t0

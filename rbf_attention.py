@@ -1293,12 +1293,23 @@ def _causal_mask_fn(b, h, q_idx, k_idx):
 
 
 def rbf_flex_attention(q, k, v, is_causal=True):
+    # Standard contiguous call (helps standard eager mode)
     q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+
     b, h, s, d = q.shape
     sm_scale = 1.0 / (d**0.5)
 
     # Cast to float prior to scaling to preserve safe accuracy bounds
     k_sq_scaled = (k.float().pow(2).sum(dim=-1) * sm_scale).to(k.dtype)
+
+    # --- FIX FOR INDUCTOR EVALUATION CRASH ---
+    # In eval mode (no_grad), Inductor delays memory allocation (FlexibleLayout).
+    # flex_attention requires materialized physical memory (FixedLayout).
+    # A graph break cleanly forces Inductor to materialize all pending buffers
+    # before proceeding to flex_attention.
+    if not torch.is_grad_enabled():
+        torch._dynamo.graph_break()
+    # ------------------------------------------------
 
     def rbf_score_mod(score, b, h, q_idx, k_idx):
         return (2.0 * score) - k_sq_scaled[b, h, k_idx]
