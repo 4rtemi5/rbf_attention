@@ -1304,9 +1304,8 @@ def rbf_flex_attention(q, k, v, is_causal=True):
 
     # --- FIX FOR INDUCTOR EVALUATION CRASH ---
     # In eval mode (no_grad), Inductor delays memory allocation (FlexibleLayout).
-    # flex_attention requires materialized physical memory (FixedLayout).
-    # A graph break cleanly forces Inductor to materialize all pending buffers
-    # before proceeding to flex_attention.
+    # flex_attention requires materialized memory (FixedLayout).
+    # Adding a graph break forces Inductor to materialize all pending buffers.
     if not torch.is_grad_enabled():
         torch._dynamo.graph_break()
     # ------------------------------------------------
