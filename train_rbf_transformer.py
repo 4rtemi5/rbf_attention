@@ -42,7 +42,7 @@ class TrainingConfig:
     warmup_steps: int = 1000
     use_amp: bool = torch.cuda.is_available()
     standard_training_attention: str = "standard"
-    rbf_training_attention: str = "rbf_flex"
+    rbf_training_attention: str = "rbf_triton"
 
     # use slow variants for evaluation to be able to output attention maps
     standard_eval_attention: str = "standard_slow"
@@ -112,11 +112,31 @@ def prepare_tiny_stories(
 
 class TransformerBlock(nn.Module):
     def __init__(
-        self, emb_dim, num_heads, max_seq_len, use_rope, attention_type, num_registers=0
+        self,
+        emb_dim,
+        num_heads,
+        max_seq_len,
+        use_rope,
+        attention_type,
+        use_qk_norm=False,
+        use_xsa=False,
+        num_registers=0,
     ):
         super().__init__()
+
+        self.attention_type = attention_type
+        self.use_qk_norm = use_qk_norm
+        self.use_xsa = use_xsa
+
         self.attn = CustomCausalAttention(
-            num_heads, emb_dim, max_seq_len, use_rope, attention_type, num_registers
+            num_heads,
+            emb_dim,
+            max_seq_len,
+            use_rope,
+            attention_type,
+            self.use_qk_norm,
+            self.use_xsa,
+            num_registers,
         )
         self.ln1 = nn.LayerNorm(emb_dim)
         self.ff = nn.Sequential(
@@ -140,11 +160,17 @@ class CausalLM(nn.Module):
         num_heads=4,
         max_seq_len=1024,
         pos_emb_type="none",  # none, rope, learned
+        use_qk_norm=False,
         num_registers=0,
         attention_type="standard",
     ):
         super().__init__()
         self.num_registers = num_registers
+
+        self.use_qk_norm = use_qk_norm
+        assert not (self.use_qk_norm and attention_type.startswith("rbf")), (
+            "QK-Norm requires standard attention"
+        )
 
         if self.num_registers > 0:
             if attention_type.startswith("standard"):
@@ -179,7 +205,9 @@ class CausalLM(nn.Module):
                     max_seq_len,
                     self.use_rope,
                     attention_type,
-                    num_registers,
+                    use_qk_norm=self.use_qk_norm,
+                    use_xsa=False,  # Default to False for now, will be passed from config later
+                    num_registers=num_registers,
                 )
                 for _ in range(num_layers)
             ]

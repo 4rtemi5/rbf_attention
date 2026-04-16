@@ -73,7 +73,6 @@ def _sq_norm_kernel(
     )
     mask_n = offs_n < N_CTX
 
-    # Bypass 2D masking to unleash 128-bit vectorized loads natively
     if BLOCK_DMODEL == D_HEAD:
         x = tl.load(x_ptrs, mask=mask_n[:, None], other=0.0)
     else:
@@ -84,7 +83,6 @@ def _sq_norm_kernel(
     x_f32 = x.to(tl.float32)
     sq = tl.sum(x_f32 * x_f32, axis=1)
 
-    # [Equivalence Fix] Accurately replicate PyTorch's eager bitwise fp16 downcast truncation
     sq_casted = sq.to(X.dtype.element_ty).to(tl.float32)
     sq_scaled = sq_casted * sm_scale
 
@@ -208,7 +206,6 @@ def _rbf_attn_fwd_kernel(
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         qk += tl.dot(q, tl.trans(k))
 
-        # Scaling accurately in FP32 accumulation registers ensures perfect SDPA baseline equivalence
         logits = qk * (2.0 * sm_scale) - k_sq_scaled[None, :]
 
         if IS_CAUSAL and start_m * BLOCK_M < start_n + BLOCK_N:
@@ -221,7 +218,6 @@ def _rbf_attn_fwd_kernel(
         logits = logits.to(tl.float32)
         m_ij = tl.maximum(m_i, tl.max(logits, 1))
 
-        # Exact `exp` maps cleanly back to standard PyTorch C++ Math baseline implementation
         p = tl.math.exp(logits - m_ij[:, None])
         l_ij = tl.sum(p, 1)
         alpha = tl.math.exp(m_i - m_ij)
@@ -446,7 +442,6 @@ def _rbf_attn_bwd_dk_dv_kernel(
 
         delta = tl.load(delta_ptrs, mask=mask_m, other=0.0)
 
-        # [EQUIVALENCE FIX] Cast identically to FP16 first to mirror PyTorch SDPA traces
         d_logits = p * (dp - delta[:, None])
         ds_scaled = d_logits * (2.0 * sm_scale)
         ds_scaled_f16 = ds_scaled.to(Q.dtype.element_ty)
@@ -459,7 +454,6 @@ def _rbf_attn_bwd_dk_dv_kernel(
         l_ptrs += BLOCK_M
         delta_ptrs += BLOCK_M
 
-    # Explicitly cast accumulators to exactly match backwards memory gradients from PyTorch baseline
     dk_dot_f16 = dk_dot.to(K.dtype.element_ty).to(tl.float32)
     d_k_sq_f16 = ds_scaled_sum_k_acc.to(K.dtype.element_ty).to(tl.float32)
 
@@ -649,172 +643,446 @@ def _rbf_attn_bwd_dq_kernel(
         )
 
 
-class TritonScaledRBFAttention(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, q, k, v, is_causal=True):
-        # Guarantee memory alignment natively
-        q = q.contiguous() if q.stride(-1) != 1 else q
-        k = k.contiguous() if k.stride(-1) != 1 else k
-        v = v.contiguous() if v.stride(-1) != 1 else v
+# =========================================================================
+# TORCH.LIBRARY CUSTOM OP MIGRATION (PyTorch 2.4+ Native Fusion)
+# =========================================================================
 
-        B, H, N_CTX, D_HEAD = q.shape
-        out = torch.empty_like(q)
-        L = torch.empty((B, H, N_CTX), device=q.device, dtype=torch.float32)
 
-        sm_scale = 1.0 / math.sqrt(D_HEAD)
-        BLOCK_DMODEL = max(16, triton.next_power_of_2(D_HEAD))
+# --- 1. Scaled RBF Attention ---
+@torch.library.custom_op("rbf_attn::scaled_fwd", mutates_args=())
+def rbf_scaled_fwd(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, is_causal: bool
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+    B, H, N_CTX, D_HEAD = q.shape
 
-        # Replace the 134MB intermediate FP32 PyTorch explosion with a highly contained SRAM block-kernel
-        k_sq_scaled = torch.empty((B, H, N_CTX), device=k.device, dtype=torch.float32)
-        grid_sq = (triton.cdiv(N_CTX, 128), B * H, 1)
-        _sq_norm_kernel[grid_sq](
-            k,
-            k_sq_scaled,
-            sm_scale,
-            k.stride(0),
-            k.stride(1),
-            k.stride(2),
-            k_sq_scaled.stride(0),
-            k_sq_scaled.stride(1),
-            B,
-            H,
-            N_CTX,
-            D_HEAD=D_HEAD,
-            BLOCK_DMODEL=BLOCK_DMODEL,
-            BLOCK_N=128,
-        )
+    out = torch.empty_like(q)
+    L = q.new_empty((B, H, N_CTX), dtype=torch.float32)
+    k_sq_scaled = q.new_empty((B, H, N_CTX), dtype=torch.float32)
 
-        grid = lambda meta: (triton.cdiv(N_CTX, meta["BLOCK_M"]), B * H, 1)
-        _rbf_attn_fwd_kernel[grid](
-            q,
-            k,
-            v,
-            k_sq_scaled,
-            sm_scale,
-            out,
-            L,
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            k.stride(0),
-            k.stride(1),
-            k.stride(2),
-            v.stride(0),
-            v.stride(1),
-            v.stride(2),
-            k_sq_scaled.stride(0),
-            k_sq_scaled.stride(1),
-            out.stride(0),
-            out.stride(1),
-            out.stride(2),
-            B,
-            H,
-            N_CTX,
-            BLOCK_DMODEL=BLOCK_DMODEL,
-            IS_CAUSAL=is_causal,
-            D_HEAD=D_HEAD,
-        )
+    sm_scale = 1.0 / math.sqrt(D_HEAD)
+    BLOCK_DMODEL = max(16, triton.next_power_of_2(D_HEAD))
 
-        ctx.save_for_backward(q, k, v, out, L, k_sq_scaled)
-        ctx.sm_scale, ctx.is_causal = sm_scale, is_causal
-        return out
+    grid_sq = (triton.cdiv(N_CTX, 128), B * H, 1)
+    _sq_norm_kernel[grid_sq](
+        k,
+        k_sq_scaled,
+        sm_scale,
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        k_sq_scaled.stride(0),
+        k_sq_scaled.stride(1),
+        B,
+        H,
+        N_CTX,
+        D_HEAD=D_HEAD,
+        BLOCK_DMODEL=BLOCK_DMODEL,
+        BLOCK_N=128,
+    )
 
-    @staticmethod
-    def backward(ctx, dout):
-        q, k, v, out, L, k_sq_scaled = ctx.saved_tensors
-        dout = dout.contiguous() if dout.stride(-1) != 1 else dout
-        B, H, N_CTX, D_HEAD = q.shape
+    grid = lambda meta: (triton.cdiv(N_CTX, meta["BLOCK_M"]), B * H, 1)  # noqa: E731
+    _rbf_attn_fwd_kernel[grid](
+        q,
+        k,
+        v,
+        k_sq_scaled,
+        sm_scale,
+        out,
+        L,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        k_sq_scaled.stride(0),
+        k_sq_scaled.stride(1),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        B,
+        H,
+        N_CTX,
+        BLOCK_DMODEL=BLOCK_DMODEL,
+        IS_CAUSAL=is_causal,
+        D_HEAD=D_HEAD,
+    )
+    return out, L, k_sq_scaled
 
-        PREPROCESS_BLOCK_M = 64
-        BLOCK_DMODEL = max(16, triton.next_power_of_2(D_HEAD))
 
-        Delta = torch.empty((B, H, N_CTX), device=q.device, dtype=torch.float32)
+@rbf_scaled_fwd.register_fake
+def _(q, k, v, is_causal):
+    B, H, N_CTX, D_HEAD = q.shape
+    return (
+        # FIX 1: Use .new_empty() to predict contiguous strides,
+        # instead of empty_like() which inherits non-contiguous strides.
+        q.new_empty(q.shape),
+        q.new_empty((B, H, N_CTX), dtype=torch.float32),
+        k.new_empty((B, H, N_CTX), dtype=torch.float32),
+    )
 
-        _bwd_preprocess[(triton.cdiv(N_CTX, PREPROCESS_BLOCK_M), B * H, 1)](
-            out,
-            dout,
-            Delta,
-            out.stride(0),
-            out.stride(1),
-            out.stride(2),
-            dout.stride(0),
-            dout.stride(1),
-            dout.stride(2),
-            B,
-            H,
-            N_CTX,
-            BLOCK_M=PREPROCESS_BLOCK_M,
-            BLOCK_DMODEL=BLOCK_DMODEL,
-            D_HEAD=D_HEAD,
-        )
 
-        # Initialize to perfect contiguous_formats mapping dense operations
-        dq = torch.empty_like(q, memory_format=torch.contiguous_format)
-        dk = torch.empty_like(k, memory_format=torch.contiguous_format)
-        dv = torch.empty_like(v, memory_format=torch.contiguous_format)
+@torch.library.custom_op("rbf_attn::scaled_bwd", mutates_args=())
+def rbf_scaled_bwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    L: torch.Tensor,
+    k_sq_scaled: torch.Tensor,
+    dout: torch.Tensor,
+    is_causal: bool,
+    sm_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # FIX 2: Ensure all tensors are completely contiguous!
+    # The backward kernels use `stride_qz` to index into `DO`, meaning
+    # Q and DO must have perfectly identical memory alignments.
+    q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+    out, dout = out.contiguous(), dout.contiguous()
 
-        grid_dk_dv = lambda meta: (triton.cdiv(N_CTX, meta["BLOCK_N"]), B * H, 1)
-        _rbf_attn_bwd_dk_dv_kernel[grid_dk_dv](
-            q,
-            k,
-            v,
-            k_sq_scaled,
-            ctx.sm_scale,
-            dout,
-            dk,
-            dv,
-            L,
-            Delta,
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            k.stride(0),
-            k.stride(1),
-            k.stride(2),
-            v.stride(0),
-            v.stride(1),
-            v.stride(2),
-            k_sq_scaled.stride(0),
-            k_sq_scaled.stride(1),
-            B,
-            H,
-            N_CTX,
-            BLOCK_DMODEL=BLOCK_DMODEL,
-            IS_CAUSAL=ctx.is_causal,
-            D_HEAD=D_HEAD,
-        )
+    B, H, N_CTX, D_HEAD = q.shape
 
-        grid_dq = lambda meta: (triton.cdiv(N_CTX, meta["BLOCK_M"]), B * H, 1)
-        _rbf_attn_bwd_dq_kernel[grid_dq](
-            q,
-            k,
-            v,
-            k_sq_scaled,
-            ctx.sm_scale,
-            dout,
-            dq,
-            L,
-            Delta,
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            k.stride(0),
-            k.stride(1),
-            k.stride(2),
-            v.stride(0),
-            v.stride(1),
-            v.stride(2),
-            k_sq_scaled.stride(0),
-            k_sq_scaled.stride(1),
-            B,
-            H,
-            N_CTX,
-            BLOCK_DMODEL=BLOCK_DMODEL,
-            IS_CAUSAL=ctx.is_causal,
-            D_HEAD=D_HEAD,
-        )
-        return dq, dk, dv, None
+    PREPROCESS_BLOCK_M = 64
+    BLOCK_DMODEL = max(16, triton.next_power_of_2(D_HEAD))
 
+    Delta = q.new_empty((B, H, N_CTX), dtype=torch.float32)
+    _bwd_preprocess[(triton.cdiv(N_CTX, PREPROCESS_BLOCK_M), B * H, 1)](
+        out,
+        dout,
+        Delta,
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        dout.stride(0),
+        dout.stride(1),
+        dout.stride(2),
+        B,
+        H,
+        N_CTX,
+        BLOCK_M=PREPROCESS_BLOCK_M,
+        BLOCK_DMODEL=BLOCK_DMODEL,
+        D_HEAD=D_HEAD,
+    )
+
+    dq = torch.empty_like(q)
+    dk = torch.empty_like(k)
+    dv = torch.empty_like(v)
+
+    grid_dk_dv = lambda meta: (triton.cdiv(N_CTX, meta["BLOCK_N"]), B * H, 1)  # noqa: E731
+    _rbf_attn_bwd_dk_dv_kernel[grid_dk_dv](
+        q,
+        k,
+        v,
+        k_sq_scaled,
+        sm_scale,
+        dout,
+        dk,
+        dv,
+        L,
+        Delta,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        k_sq_scaled.stride(0),
+        k_sq_scaled.stride(1),
+        B,
+        H,
+        N_CTX,
+        BLOCK_DMODEL=BLOCK_DMODEL,
+        IS_CAUSAL=is_causal,
+        D_HEAD=D_HEAD,
+    )
+
+    grid_dq = lambda meta: (triton.cdiv(N_CTX, meta["BLOCK_M"]), B * H, 1)  # noqa: E731
+    _rbf_attn_bwd_dq_kernel[grid_dq](
+        q,
+        k,
+        v,
+        k_sq_scaled,
+        sm_scale,
+        dout,
+        dq,
+        L,
+        Delta,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        k_sq_scaled.stride(0),
+        k_sq_scaled.stride(1),
+        B,
+        H,
+        N_CTX,
+        BLOCK_DMODEL=BLOCK_DMODEL,
+        IS_CAUSAL=is_causal,
+        D_HEAD=D_HEAD,
+    )
+    return dq, dk, dv
+
+
+@rbf_scaled_bwd.register_fake
+def _(q, k, v, out, L, k_sq_scaled, dout, is_causal, sm_scale):
+    return q.new_empty(q.shape), k.new_empty(k.shape), v.new_empty(v.shape)
+
+
+def rbf_scaled_setup_context(ctx, inputs, output):
+    q, k, v, is_causal = inputs
+    out, L, k_sq_scaled = output
+    ctx.save_for_backward(q, k, v, out, L, k_sq_scaled)
+    ctx.is_causal = is_causal
+    ctx.sm_scale = 1.0 / math.sqrt(q.shape[-1])
+
+
+def rbf_scaled_backward(ctx, dout, dL, dk_sq_scaled):
+    q, k, v, out, L, k_sq_scaled = ctx.saved_tensors
+    dq, dk, dv = torch.ops.rbf_attn.scaled_bwd(
+        q, k, v, out, L, k_sq_scaled, dout, ctx.is_causal, ctx.sm_scale
+    )
+    return dq, dk, dv, None
+
+
+torch.library.register_autograd(
+    "rbf_attn::scaled_fwd", rbf_scaled_backward, setup_context=rbf_scaled_setup_context
+)
+
+
+# -------------------------------------------------------------------------
+# Clean Python Wrappers
+# -------------------------------------------------------------------------
+def run_triton_rbf(q, k, v, is_causal=True):
+    return torch.ops.rbf_attn.scaled_fwd(q, k, v, is_causal)[0]
+
+
+def run_triton_non_softmax_rbf(q, k, v, is_causal=True):
+    return torch.ops.rbf_attn.non_softmax_fwd(q, k, v, is_causal)[0]
+
+
+# =========================================================================
+# NON-SOFTMAX KERNELS & WRAPPERS
+# =========================================================================
+
+
+@torch.library.custom_op("rbf_attn::non_softmax_fwd", mutates_args=())
+def rbf_non_softmax_fwd(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, is_causal: bool
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+    B, H, N_CTX, D_HEAD = q.shape
+    out = torch.empty_like(q)
+
+    sm_scale = 1.0 / math.sqrt(D_HEAD)
+    BLOCK_DMODEL = max(16, triton.next_power_of_2(D_HEAD))
+
+    q_sq_scaled = q.new_empty((B, H, N_CTX), dtype=torch.float32)
+    k_sq_scaled = k.new_empty((B, H, N_CTX), dtype=torch.float32)
+
+    grid_sq = (triton.cdiv(N_CTX, 128), B * H, 1)
+    _sq_norm_kernel[grid_sq](
+        q,
+        q_sq_scaled,
+        sm_scale,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        q_sq_scaled.stride(0),
+        q_sq_scaled.stride(1),
+        B,
+        H,
+        N_CTX,
+        D_HEAD=D_HEAD,
+        BLOCK_DMODEL=BLOCK_DMODEL,
+        BLOCK_N=128,
+    )
+    _sq_norm_kernel[grid_sq](
+        k,
+        k_sq_scaled,
+        sm_scale,
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        k_sq_scaled.stride(0),
+        k_sq_scaled.stride(1),
+        B,
+        H,
+        N_CTX,
+        D_HEAD=D_HEAD,
+        BLOCK_DMODEL=BLOCK_DMODEL,
+        BLOCK_N=128,
+    )
+
+    grid = lambda meta: (triton.cdiv(N_CTX, meta["BLOCK_M"]), B * H, 1)  # noqa: E731
+    _rbf_non_softmax_fwd_kernel[grid](
+        q,
+        k,
+        v,
+        q_sq_scaled,
+        k_sq_scaled,
+        sm_scale,
+        out,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        q_sq_scaled.stride(0),
+        q_sq_scaled.stride(1),
+        k_sq_scaled.stride(0),
+        k_sq_scaled.stride(1),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        B,
+        H,
+        N_CTX,
+        BLOCK_DMODEL=BLOCK_DMODEL,
+        IS_CAUSAL=is_causal,
+        D_HEAD=D_HEAD,
+    )
+    return out, q_sq_scaled, k_sq_scaled
+
+
+@rbf_non_softmax_fwd.register_fake
+def _(q, k, v, is_causal):
+    B, H, N_CTX, D_HEAD = q.shape
+    return (
+        q.new_empty(q.shape),
+        q.new_empty((B, H, N_CTX), dtype=torch.float32),
+        k.new_empty((B, H, N_CTX), dtype=torch.float32),
+    )
+
+
+@torch.library.custom_op("rbf_attn::non_softmax_bwd", mutates_args=())
+def rbf_non_softmax_bwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_sq_scaled: torch.Tensor,
+    k_sq_scaled: torch.Tensor,
+    dout: torch.Tensor,
+    is_causal: bool,
+    sm_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Ensure backward alignments match exactly
+    q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+    dout = dout.contiguous()
+
+    B, H, N_CTX, D_HEAD = q.shape
+
+    BLOCK_DMODEL = max(16, triton.next_power_of_2(D_HEAD))
+    dq = torch.empty_like(q)
+    dk = torch.empty_like(k)
+    dv = torch.empty_like(v)
+
+    grid_dk_dv = lambda meta: (triton.cdiv(N_CTX, meta["BLOCK_N"]), B * H, 1)  # noqa: E731
+    _rbf_non_softmax_bwd_dk_dv_kernel[grid_dk_dv](
+        q,
+        k,
+        v,
+        q_sq_scaled,
+        k_sq_scaled,
+        sm_scale,
+        dout,
+        dk,
+        dv,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        q_sq_scaled.stride(0),
+        q_sq_scaled.stride(1),
+        k_sq_scaled.stride(0),
+        k_sq_scaled.stride(1),
+        B,
+        H,
+        N_CTX,
+        BLOCK_DMODEL=BLOCK_DMODEL,
+        IS_CAUSAL=is_causal,
+        D_HEAD=D_HEAD,
+    )
+
+    grid_dq = lambda meta: (triton.cdiv(N_CTX, meta["BLOCK_M"]), B * H, 1)  # noqa: E731
+    _rbf_non_softmax_bwd_dq_kernel[grid_dq](
+        q,
+        k,
+        v,
+        q_sq_scaled,
+        k_sq_scaled,
+        sm_scale,
+        dout,
+        dq,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        q_sq_scaled.stride(0),
+        q_sq_scaled.stride(1),
+        k_sq_scaled.stride(0),
+        k_sq_scaled.stride(1),
+        B,
+        H,
+        N_CTX,
+        BLOCK_DMODEL=BLOCK_DMODEL,
+        IS_CAUSAL=is_causal,
+        D_HEAD=D_HEAD,
+    )
+    return dq, dk, dv
+
+
+@rbf_non_softmax_bwd.register_fake
+def _(q, k, v, q_sq_scaled, k_sq_scaled, dout, is_causal, sm_scale):
+    return q.new_empty(q.shape), k.new_empty(k.shape), v.new_empty(v.shape)
+
+
+def rbf_non_softmax_setup_context(ctx, inputs, output):
+    q, k, v, is_causal = inputs
+    out, q_sq_scaled, k_sq_scaled = output
+    ctx.save_for_backward(q, k, v, q_sq_scaled, k_sq_scaled)
+    ctx.is_causal = is_causal
+    ctx.sm_scale = 1.0 / math.sqrt(q.shape[-1])
+
+
+def rbf_non_softmax_backward(ctx, dout, dq_sq, dk_sq):
+    q, k, v, q_sq_scaled, k_sq_scaled = ctx.saved_tensors
+    dq, dk, dv = torch.ops.rbf_attn.non_softmax_bwd(
+        q, k, v, q_sq_scaled, k_sq_scaled, dout, ctx.is_causal, ctx.sm_scale
+    )
+    return dq, dk, dv, None
+
+
+torch.library.register_autograd(
+    "rbf_attn::non_softmax_fwd",
+    rbf_non_softmax_backward,
+    setup_context=rbf_non_softmax_setup_context,
+)
 
 # =========================================================================
 # NON-SOFTMAX KERNELS & WRAPPERS
@@ -1307,168 +1575,209 @@ def _rbf_non_softmax_bwd_dq_kernel(
         )
 
 
-class TritonNonSoftmaxRBFAttention(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, q, k, v, is_causal=True):
-        q = q.contiguous() if q.stride(-1) != 1 else q
-        k = k.contiguous() if k.stride(-1) != 1 else k
-        v = v.contiguous() if v.stride(-1) != 1 else v
+@torch.library.custom_op("rbf_attn::non_softmax_fwd", mutates_args=())
+def rbf_non_softmax_fwd(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, is_causal: bool
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+    B, H, N_CTX, D_HEAD = q.shape
+    out = torch.empty_like(q)
 
-        B, H, N_CTX, D_HEAD = q.shape
-        out = torch.empty_like(q)
+    sm_scale = 1.0 / math.sqrt(D_HEAD)
+    BLOCK_DMODEL = max(16, triton.next_power_of_2(D_HEAD))
 
-        sm_scale = 1.0 / math.sqrt(D_HEAD)
-        BLOCK_DMODEL = max(16, triton.next_power_of_2(D_HEAD))
+    q_sq_scaled = q.new_empty((B, H, N_CTX), dtype=torch.float32)
+    k_sq_scaled = k.new_empty((B, H, N_CTX), dtype=torch.float32)
 
-        q_sq_scaled = torch.empty((B, H, N_CTX), device=q.device, dtype=torch.float32)
-        k_sq_scaled = torch.empty((B, H, N_CTX), device=k.device, dtype=torch.float32)
+    grid_sq = (triton.cdiv(N_CTX, 128), B * H, 1)
+    _sq_norm_kernel[grid_sq](
+        q,
+        q_sq_scaled,
+        sm_scale,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        q_sq_scaled.stride(0),
+        q_sq_scaled.stride(1),
+        B,
+        H,
+        N_CTX,
+        D_HEAD=D_HEAD,
+        BLOCK_DMODEL=BLOCK_DMODEL,
+        BLOCK_N=128,
+    )
+    _sq_norm_kernel[grid_sq](
+        k,
+        k_sq_scaled,
+        sm_scale,
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        k_sq_scaled.stride(0),
+        k_sq_scaled.stride(1),
+        B,
+        H,
+        N_CTX,
+        D_HEAD=D_HEAD,
+        BLOCK_DMODEL=BLOCK_DMODEL,
+        BLOCK_N=128,
+    )
 
-        grid_sq = (triton.cdiv(N_CTX, 128), B * H, 1)
-        _sq_norm_kernel[grid_sq](
-            q,
-            q_sq_scaled,
-            sm_scale,
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            q_sq_scaled.stride(0),
-            q_sq_scaled.stride(1),
-            B,
-            H,
-            N_CTX,
-            D_HEAD=D_HEAD,
-            BLOCK_DMODEL=BLOCK_DMODEL,
-            BLOCK_N=128,
-        )
-        _sq_norm_kernel[grid_sq](
-            k,
-            k_sq_scaled,
-            sm_scale,
-            k.stride(0),
-            k.stride(1),
-            k.stride(2),
-            k_sq_scaled.stride(0),
-            k_sq_scaled.stride(1),
-            B,
-            H,
-            N_CTX,
-            D_HEAD=D_HEAD,
-            BLOCK_DMODEL=BLOCK_DMODEL,
-            BLOCK_N=128,
-        )
+    grid = lambda meta: (triton.cdiv(N_CTX, meta["BLOCK_M"]), B * H, 1)  # noqa: E731
+    _rbf_non_softmax_fwd_kernel[grid](
+        q,
+        k,
+        v,
+        q_sq_scaled,
+        k_sq_scaled,
+        sm_scale,
+        out,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        q_sq_scaled.stride(0),
+        q_sq_scaled.stride(1),
+        k_sq_scaled.stride(0),
+        k_sq_scaled.stride(1),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        B,
+        H,
+        N_CTX,
+        BLOCK_DMODEL=BLOCK_DMODEL,
+        IS_CAUSAL=is_causal,
+        D_HEAD=D_HEAD,
+    )
+    return out, q_sq_scaled, k_sq_scaled
 
-        grid = lambda meta: (triton.cdiv(N_CTX, meta["BLOCK_M"]), B * H, 1)
-        _rbf_non_softmax_fwd_kernel[grid](
-            q,
-            k,
-            v,
-            q_sq_scaled,
-            k_sq_scaled,
-            sm_scale,
-            out,
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            k.stride(0),
-            k.stride(1),
-            k.stride(2),
-            v.stride(0),
-            v.stride(1),
-            v.stride(2),
-            q_sq_scaled.stride(0),
-            q_sq_scaled.stride(1),
-            k_sq_scaled.stride(0),
-            k_sq_scaled.stride(1),
-            out.stride(0),
-            out.stride(1),
-            out.stride(2),
-            B,
-            H,
-            N_CTX,
-            BLOCK_DMODEL=BLOCK_DMODEL,
-            IS_CAUSAL=is_causal,
-            D_HEAD=D_HEAD,
-        )
 
-        ctx.save_for_backward(q, k, v, q_sq_scaled, k_sq_scaled)
-        ctx.sm_scale, ctx.is_causal = sm_scale, is_causal
-        return out
+@rbf_non_softmax_fwd.register_fake
+def _(q, k, v, is_causal):
+    B, H, N_CTX, D_HEAD = q.shape
+    return (
+        torch.empty_like(q),
+        q.new_empty((B, H, N_CTX), dtype=torch.float32),
+        k.new_empty((B, H, N_CTX), dtype=torch.float32),
+    )
 
-    @staticmethod
-    def backward(ctx, dout):
-        q, k, v, q_sq_scaled, k_sq_scaled = ctx.saved_tensors
-        dout = dout.contiguous() if dout.stride(-1) != 1 else dout
-        B, H, N_CTX, D_HEAD = q.shape
 
-        BLOCK_DMODEL = max(16, triton.next_power_of_2(D_HEAD))
-        dq = torch.empty_like(q, memory_format=torch.contiguous_format)
-        dk = torch.empty_like(k, memory_format=torch.contiguous_format)
-        dv = torch.empty_like(v, memory_format=torch.contiguous_format)
+@torch.library.custom_op("rbf_attn::non_softmax_bwd", mutates_args=())
+def rbf_non_softmax_bwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_sq_scaled: torch.Tensor,
+    k_sq_scaled: torch.Tensor,
+    dout: torch.Tensor,
+    is_causal: bool,
+    sm_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    dout = dout.contiguous()
+    B, H, N_CTX, D_HEAD = q.shape
 
-        grid_dk_dv = lambda meta: (triton.cdiv(N_CTX, meta["BLOCK_N"]), B * H, 1)
-        _rbf_non_softmax_bwd_dk_dv_kernel[grid_dk_dv](
-            q,
-            k,
-            v,
-            q_sq_scaled,
-            k_sq_scaled,
-            ctx.sm_scale,
-            dout,
-            dk,
-            dv,
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            k.stride(0),
-            k.stride(1),
-            k.stride(2),
-            v.stride(0),
-            v.stride(1),
-            v.stride(2),
-            q_sq_scaled.stride(0),
-            q_sq_scaled.stride(1),
-            k_sq_scaled.stride(0),
-            k_sq_scaled.stride(1),
-            B,
-            H,
-            N_CTX,
-            BLOCK_DMODEL=BLOCK_DMODEL,
-            IS_CAUSAL=ctx.is_causal,
-            D_HEAD=D_HEAD,
-        )
+    BLOCK_DMODEL = max(16, triton.next_power_of_2(D_HEAD))
+    dq = torch.empty_like(q, memory_format=torch.contiguous_format)
+    dk = torch.empty_like(k, memory_format=torch.contiguous_format)
+    dv = torch.empty_like(v, memory_format=torch.contiguous_format)
 
-        grid_dq = lambda meta: (triton.cdiv(N_CTX, meta["BLOCK_M"]), B * H, 1)
-        _rbf_non_softmax_bwd_dq_kernel[grid_dq](
-            q,
-            k,
-            v,
-            q_sq_scaled,
-            k_sq_scaled,
-            ctx.sm_scale,
-            dout,
-            dq,
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            k.stride(0),
-            k.stride(1),
-            k.stride(2),
-            v.stride(0),
-            v.stride(1),
-            v.stride(2),
-            q_sq_scaled.stride(0),
-            q_sq_scaled.stride(1),
-            k_sq_scaled.stride(0),
-            k_sq_scaled.stride(1),
-            B,
-            H,
-            N_CTX,
-            BLOCK_DMODEL=BLOCK_DMODEL,
-            IS_CAUSAL=ctx.is_causal,
-            D_HEAD=D_HEAD,
-        )
-        return dq, dk, dv, None
+    grid_dk_dv = lambda meta: (triton.cdiv(N_CTX, meta["BLOCK_N"]), B * H, 1)  # noqa: E731
+    _rbf_non_softmax_bwd_dk_dv_kernel[grid_dk_dv](
+        q,
+        k,
+        v,
+        q_sq_scaled,
+        k_sq_scaled,
+        sm_scale,
+        dout,
+        dk,
+        dv,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        q_sq_scaled.stride(0),
+        q_sq_scaled.stride(1),
+        k_sq_scaled.stride(0),
+        k_sq_scaled.stride(1),
+        B,
+        H,
+        N_CTX,
+        BLOCK_DMODEL=BLOCK_DMODEL,
+        IS_CAUSAL=is_causal,
+        D_HEAD=D_HEAD,
+    )
 
+    grid_dq = lambda meta: (triton.cdiv(N_CTX, meta["BLOCK_M"]), B * H, 1)  # noqa: E731
+    _rbf_non_softmax_bwd_dq_kernel[grid_dq](
+        q,
+        k,
+        v,
+        q_sq_scaled,
+        k_sq_scaled,
+        sm_scale,
+        dout,
+        dq,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        q_sq_scaled.stride(0),
+        q_sq_scaled.stride(1),
+        k_sq_scaled.stride(0),
+        k_sq_scaled.stride(1),
+        B,
+        H,
+        N_CTX,
+        BLOCK_DMODEL=BLOCK_DMODEL,
+        IS_CAUSAL=is_causal,
+        D_HEAD=D_HEAD,
+    )
+    return dq, dk, dv
+
+
+@rbf_non_softmax_bwd.register_fake
+def _(q, k, v, q_sq_scaled, k_sq_scaled, dout, is_causal, sm_scale):
+    return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+
+
+def rbf_non_softmax_setup_context(ctx, inputs, output):
+    q, k, v, is_causal = inputs
+    out, q_sq_scaled, k_sq_scaled = output
+    ctx.save_for_backward(q, k, v, q_sq_scaled, k_sq_scaled)
+    ctx.is_causal = is_causal
+    ctx.sm_scale = 1.0 / math.sqrt(q.shape[-1])
+
+
+def rbf_non_softmax_backward(ctx, dout, dq_sq, dk_sq):
+    q, k, v, q_sq_scaled, k_sq_scaled = ctx.saved_tensors
+    dq, dk, dv = torch.ops.rbf_attn.non_softmax_bwd(
+        q, k, v, q_sq_scaled, k_sq_scaled, dout, ctx.is_causal, ctx.sm_scale
+    )
+    return dq, dk, dv, None
+
+
+torch.library.register_autograd(
+    "rbf_attn::non_softmax_fwd",
+    rbf_non_softmax_backward,
+    setup_context=rbf_non_softmax_setup_context,
+)
 
 # =========================================================================
 # UTILITIES & POSITIONAL ENCODINGS
@@ -1532,31 +1841,34 @@ def _causal_mask_fn(b, h, q_idx, k_idx):
     return q_idx >= k_idx
 
 
+def get_causal_mask_flex(seq_len, device):
+    dev_str = str(torch.tensor([], device=device).device)
+    key = (seq_len, dev_str)
+    if key not in _FLEX_MASK_CACHE:
+        _FLEX_MASK_CACHE[key] = create_block_mask(
+            _causal_mask_fn,
+            B=None,
+            H=None,
+            Q_LEN=seq_len,
+            KV_LEN=seq_len,
+            device=dev_str,
+        )
+    return _FLEX_MASK_CACHE[key]
+
+
 def rbf_flex_attention(q, k, v, is_causal=True):
-    # Eliminate the 134MB Flex-Attention eager pre-compute spike
-    q = q.contiguous() if q.stride(-1) != 1 else q
-    k = k.contiguous() if k.stride(-1) != 1 else k
-    v = v.contiguous() if v.stride(-1) != 1 else v
     b, h, s, d = q.shape
     sm_scale = 1.0 / (d**0.5)
 
-    # Simple PyTorch 1D operation cleanly fused by Dynamo
     k_sq_scaled = (torch.sum(k * k, dim=-1, dtype=torch.float32) * sm_scale).to(k.dtype)
-
-    if not torch.is_grad_enabled():
-        torch._dynamo.graph_break()
+    torch._dynamo.graph_break()
 
     def rbf_score_mod(score, b, h, q_idx, k_idx):
         return (2.0 * score) - k_sq_scaled[b, h, k_idx]
 
     block_mask = None
     if is_causal:
-        key = (s, str(q.device))
-        if key not in _FLEX_MASK_CACHE:
-            _FLEX_MASK_CACHE[key] = create_block_mask(
-                _causal_mask_fn, B=None, H=None, Q_LEN=s, KV_LEN=s, device=str(q.device)
-            )
-        block_mask = _FLEX_MASK_CACHE[key]
+        block_mask = get_causal_mask_flex(s, q.device)
 
     return flex_attention(q, k, v, score_mod=rbf_score_mod, block_mask=block_mask)
 
@@ -1569,11 +1881,15 @@ class CustomCausalAttention(nn.Module):
         max_seq_len=2048,
         use_rope=True,
         attention_type="standard",
+        use_qk_norm=False,
+        apply_xsa=False,
         num_registers=0,
     ):
         super().__init__()
         self.num_heads = num_heads
         self.attention_type = attention_type
+        self.use_qk_norm = use_qk_norm
+        self.apply_xsa = apply_xsa
         self.num_registers = num_registers
         self.head_dim = emb_dims // num_heads
 
@@ -1607,26 +1923,40 @@ class CustomCausalAttention(nn.Module):
 
     def forward(self, x):
         b, s, _ = x.shape
+        attn_weights = None
         qkv = self.qkv_proj(x)
         q, k, v = rearrange(
             qkv, "b s (qkv h n) -> qkv b h s n", qkv=3, h=self.num_heads
         )
+        if self.use_qk_norm:
+            q = F.rms_norm(q, (self.head_dim,))
+            k = F.rms_norm(k, (self.head_dim,))
 
         if self.positional_encoding_type == "susie":
-            tied_weight = self.pos_weight.repeat(1, 1, 1, 2).to(q.dtype)
+            pos_weight = self.pos_weight.to(q.dtype)  # [1, H, 1, D/2]
+
             if self.num_registers > 0:
                 text_len = s - self.num_registers
                 pos_emb_seq = self.susie_cache[:text_len].to(
                     device=q.device, dtype=q.dtype
                 )
-                pos_emb_seq = (
-                    pos_emb_seq.view(1, 1, text_len, self.pos_dim) * tied_weight
+
+                # BUG FIX: Replaced .repeat() with highly efficient broadcasting, but swapped .view() for .reshape()
+                # because expanding axes natively via broadcasting can disrupt contiguous memory layouts.
+                pos_emb_seq = pos_emb_seq.view(1, 1, text_len, 2, self.pos_dim // 2)
+                pos_emb_seq = (pos_emb_seq * pos_weight.unsqueeze(-2)).reshape(
+                    1, self.num_heads, text_len, self.pos_dim
                 )
                 pos_emb_reg = self.reg_pos_emb.to(q.dtype)
                 pos_emb = torch.cat([pos_emb_reg, pos_emb_seq], dim=2)
             else:
                 pos_emb = self.susie_cache[:s].to(device=q.device, dtype=q.dtype)
-                pos_emb = pos_emb.view(1, 1, s, self.pos_dim) * tied_weight
+
+                pos_emb = pos_emb.view(1, 1, s, 2, self.pos_dim // 2)
+                pos_emb = (pos_emb * pos_weight.unsqueeze(-2)).reshape(
+                    1, self.num_heads, s, self.pos_dim
+                )
+
             q, k = q + pos_emb, k + pos_emb
 
         elif self.positional_encoding_type == "rope":
@@ -1676,7 +2006,7 @@ class CustomCausalAttention(nn.Module):
             if v_pad_len > 0:
                 out = out[..., :-v_pad_len]
         elif self.attention_type == "rbf_triton":
-            out = TritonScaledRBFAttention.apply(q, k, v, True)
+            out = run_triton_rbf(q, k, v, is_causal=True)
         elif self.attention_type == "rbf_slow":
             attn_logits = compute_rbf_logits(q, k)
             causal_mask = get_causal_mask(s, x.device)
@@ -1694,10 +2024,14 @@ class CustomCausalAttention(nn.Module):
             )
             out = attn_weights @ v
         elif self.attention_type == "rbf_non_softmax":
-            out = TritonNonSoftmaxRBFAttention.apply(q, k, v, True)
+            out = run_triton_non_softmax_rbf(q, k, v, is_causal=True)
+
+        if self.apply_xsa:
+            v_n = F.normalize(v, dim=-1)
+            out = out - (out * v_n).sum(dim=-1, keepdim=True) * v_n
 
         out = rearrange(out, "b h s n -> b s (h n)")
-        return self.proj(out), None
+        return self.proj(out), attn_weights
 
 
 # ==========================================
@@ -1734,8 +2068,14 @@ def run_sdpa(q, k, v):
     return F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
 
-def run_triton_rbf(q, k, v):
-    return TritonScaledRBFAttention.apply(q, k, v, True)
+def run_sdpa_qk_norm(q, k, v):
+    q = F.rms_norm(q, (HEAD_DIM,))
+    k = F.rms_norm(k, (HEAD_DIM,))
+    return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
+
+def run_triton_rbf_bench(q, k, v):
+    return run_triton_rbf(q, k, v, is_causal=True)
 
 
 def profile_memory(func, *args, **kwargs):
@@ -1748,30 +2088,32 @@ def profile_memory(func, *args, **kwargs):
     return peak_mb
 
 
-def run_benchmarks():
+def run_attention_benchmarks():
     print(f"Benchmarking on: {torch.cuda.get_device_name(0)}")
     print(
         f"{'Seq Len':<10} | {'Method':<25} | {'Fwd (ms)':<10} | {'Bwd (ms)':<10} | {'Peak VRAM (MB)':<15}"
     )
     print("-" * 80)
 
-    results = {
-        "SDPA Baseline": {"fwd": [], "bwd": [], "mem": []},
-        "Naive RBF Math": {"fwd": [], "bwd": [], "mem": []},
-        "RBF Triton": {"fwd": [], "bwd": [], "mem": []},
-        "RBF Flex-Attention": {"fwd": [], "bwd": [], "mem": []},
-    }
+    method_names = [
+        "SDPA Baseline",
+        "SDPA QK-Norm",
+        "Naive RBF Math",
+        "RBF Triton",
+        "RBF Flex-Attention",
+    ]
+    results = {name: {"fwd": [], "bwd": [], "mem": []} for name in method_names}
 
     for seq_len in SEQ_LENS:
-        torch._dynamo.reset()
-
         compiled_sdpa = torch.compile(run_sdpa)
+        compiled_sdpa_qk_norm = torch.compile(run_sdpa_qk_norm)
         compiled_naive = torch.compile(rbf_math_forward)
         compiled_flex = torch.compile(rbf_flex_attention)
-        compiled_triton = run_triton_rbf  # no need to re-compile triton function
+        compiled_triton = torch.compile(run_triton_rbf_bench)
 
         methods = [
             ("SDPA Baseline", compiled_sdpa),
+            ("SDPA QK-Norm", compiled_sdpa_qk_norm),
             ("Naive RBF Math", compiled_naive),
             ("RBF Triton", compiled_triton),
             ("RBF Flex-Attention", compiled_flex),
@@ -1807,6 +2149,7 @@ def run_benchmarks():
         dout = torch.randn_like(q)
 
         for name, compiled_fn in methods:
+            torch._dynamo.reset()
             try:
                 for _ in range(3):
                     q.grad, k.grad, v.grad = None, None, None
@@ -1852,7 +2195,7 @@ def run_benchmarks():
     return results
 
 
-def plot_results(results, filename="attention_profiling_results.png"):
+def plot_attention_results(results, filename="attention_profiling_results.png"):
     os.makedirs("outputs", exist_ok=True)
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
     metrics = [
@@ -1877,8 +2220,195 @@ def plot_results(results, filename="attention_profiling_results.png"):
     print(f"\nSaved benchmark plots to '{filepath}'")
 
 
+def run_layer_benchmarks():
+    print(f"Benchmarking Layers on: {torch.cuda.get_device_name(0)}")
+    print(
+        f"{'Seq Len':<10} | {'Method':<38} | {'Fwd (ms)':<10} | {'Bwd (ms)':<10} | {'Peak VRAM (MB)':<15}"
+    )
+    print("-" * 95)
+
+    configs = [
+        (
+            "SDPA + RoPE",
+            {
+                "attention_type": "standard",
+                "use_rope": True,
+                "use_qk_norm": False,
+                "apply_xsa": False,
+            },
+        ),
+        (
+            "SDPA + RoPE + QK-Norm",
+            {
+                "attention_type": "standard",
+                "use_rope": True,
+                "use_qk_norm": True,
+                "apply_xsa": False,
+            },
+        ),
+        (
+            "SDPA + RoPE + QK-Norm + XSA",
+            {
+                "attention_type": "standard",
+                "use_rope": True,
+                "use_qk_norm": True,
+                "apply_xsa": True,
+            },
+        ),
+        # (
+        #     "RBF Flex + SuSiE",
+        #     {
+        #         "attention_type": "rbf_flex",
+        #         "use_rope": True,
+        #         "use_qk_norm": False,
+        #         "apply_xsa": False,
+        #     },
+        # ),
+        # (
+        #     "RBF Flex + SuSiE + XSA",
+        #     {
+        #         "attention_type": "rbf_flex",
+        #         "use_rope": True,
+        #         "use_qk_norm": False,
+        #         "apply_xsa": True,
+        #     },
+        # ),
+        (
+            "RBF Triton + SuSiE",
+            {
+                "attention_type": "rbf_triton",
+                "use_rope": True,
+                "use_qk_norm": False,
+                "apply_xsa": False,
+            },
+        ),
+        (
+            "RBF Triton + SuSiE + XSA",
+            {
+                "attention_type": "rbf_triton",
+                "use_rope": True,
+                "use_qk_norm": False,
+                "apply_xsa": True,
+            },
+        ),
+    ]
+
+    results = {name: {"fwd": [], "bwd": [], "mem": []} for name, _ in configs}
+    emb_dims = NUM_HEADS * HEAD_DIM
+
+    for seq_len in SEQ_LENS:
+        x = torch.randn(
+            BATCH_SIZE,
+            seq_len,
+            emb_dims,
+            device=DEVICE,
+            dtype=torch.float16,
+            requires_grad=True,
+        )
+        dout = torch.randn_like(x)
+
+        for name, kwargs in configs:
+            torch._dynamo.reset()
+
+            layer = CustomCausalAttention(
+                num_heads=NUM_HEADS,
+                emb_dims=emb_dims,
+                max_seq_len=max(SEQ_LENS),
+                **kwargs,
+            ).to(DEVICE, dtype=torch.float16)
+
+            compiled_layer = torch.compile(layer)
+
+            try:
+                # Warmup
+                for _ in range(3):
+                    x.grad = None
+                    out, _ = compiled_layer(x)
+                    out.backward(dout)
+                torch.cuda.empty_cache()
+
+                # Forward benchmark
+                with torch.no_grad():
+                    fwd_ms = triton.testing.do_bench(
+                        lambda: compiled_layer(x)[0], quantiles=None
+                    )
+
+                # Memory profiling
+                x.grad = None
+
+                def wrapper_fwd(x_input):
+                    return compiled_layer(x_input)[0]
+
+                mem_mb = profile_memory(wrapper_fwd, x)
+
+                # Forward + Backward benchmark
+                def fwd_bwd():
+                    out_bwd, _ = compiled_layer(x)
+                    out_bwd.backward(dout)
+
+                fwd_bwd_ms = triton.testing.do_bench(
+                    fwd_bwd, quantiles=None, grad_to_none=[x]
+                )
+                bwd_ms = fwd_bwd_ms - fwd_ms
+
+                torch.cuda.empty_cache()
+                print(
+                    f"{seq_len:<10} | {name:<38} | {fwd_ms:<10.3f} | {bwd_ms:<10.3f} | {mem_mb:<15.2f}"
+                )
+
+                results[name]["fwd"].append(fwd_ms)
+                results[name]["bwd"].append(bwd_ms)
+                results[name]["mem"].append(mem_mb)
+
+            except Exception:
+                print(
+                    f"{seq_len:<10} | {name:<38} | {'ERROR':<10} | {'ERROR':<10} | {'ERROR':<15}"
+                )
+                results[name]["fwd"].append(float("nan"))
+                results[name]["bwd"].append(float("nan"))
+                results[name]["mem"].append(float("nan"))
+
+        print("-" * 95)
+    return results
+
+
+def plot_layer_results(results, filename="layer_profiling_results.png"):
+    os.makedirs("outputs", exist_ok=True)
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    metrics = [
+        ("fwd", "Layer Forward Time (ms)"),
+        ("bwd", "Layer Backward Time (ms)"),
+        ("mem", "Layer Peak Forward Activations (MB)"),
+    ]
+
+    for ax, (metric_key, title) in zip(axes, metrics):
+        for name, data in results.items():
+            ax.plot(SEQ_LENS, data[metric_key], marker="o", label=name)
+        ax.set_title(title)
+        ax.set_xlabel("Sequence Length")
+        ax.set_ylabel(title)
+        ax.set_xticks(SEQ_LENS)
+        ax.grid(True, linestyle="--", alpha=0.6)
+        ax.legend()
+
+    plt.tight_layout()
+    filepath = os.path.join("outputs", filename)
+    plt.savefig(filepath)
+    print(f"\nSaved layer benchmark plots to '{filepath}'")
+
+
 if __name__ == "__main__":
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    results = run_benchmarks()
-    plot_results(results)
+
+    print("Pre-computing Flex-Attention block masks...")
+    for seq_len in SEQ_LENS:
+        get_causal_mask_flex(seq_len, DEVICE)
+
+    # run attention benchmarks
+    attention_results = run_attention_benchmarks()
+    plot_attention_results(attention_results)
+
+    # run layer benchmnarks
+    layer_results = run_layer_benchmarks()
+    plot_layer_results(layer_results)

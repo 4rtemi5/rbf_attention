@@ -3,7 +3,7 @@ import math
 import torch
 import torch.nn.functional as F
 
-from rbf_attention import TritonScaledRBFAttention, rbf_flex_attention
+from rbf_attention import rbf_flex_attention, run_triton_rbf
 
 
 def rbf_math_forward(q, k, v, is_causal=True):
@@ -75,7 +75,7 @@ def run_equivalence_test(dtype=torch.float16):
     # FORWARD PASS
     # ==========================================
     out_math = rbf_math_forward(q_math, k_math, v_math, is_causal=True)
-    out_triton = TritonScaledRBFAttention.apply(q_triton, k_triton, v_triton, True)
+    out_triton = run_triton_rbf(q_triton, k_triton, v_triton, True)
     out_flex = torch.compile(rbf_flex_attention)(q_flex, k_flex, v_flex, is_causal=True)
 
     # ==========================================

@@ -6,15 +6,12 @@ import torch
 import torch.nn.functional as F
 
 import rbf_attention
-
-# Import from your existing files
 from train_rbf_transformer import CausalLM, TrainingConfig, prepare_tiny_stories
 
 
 def main():
     config = TrainingConfig()
 
-    # 1. Load the Validation Data
     print("Loading dataset...")
     _, val_loader, tokenizer = prepare_tiny_stories(
         config.batch_size,
@@ -25,7 +22,6 @@ def main():
     )
     vocab_size = len(tokenizer)
 
-    # 2. Initialize Models and Load Weights
     print("Loading models...")
     std_model = CausalLM(
         vocab_size=vocab_size,
@@ -49,13 +45,13 @@ def main():
         num_heads=config.num_heads,
         max_seq_len=config.max_seq_len,
         pos_emb_type=config.pos_emb_type,
+        use_qk_norm=False,
         num_registers=config.num_registers,
         attention_type=config.rbf_eval_attention,
     ).to(config.device)
     rbf_model.load_state_dict(torch.load("outputs/rbf_weights.pt", weights_only=True))
     rbf_model.eval()
 
-    # 3. Define Hook Functions to Intercept Keys
     std_k_norms = []
     rbf_k_norms = []
 
@@ -75,7 +71,6 @@ def main():
         rbf_k_norms.append(norms)
         return original_rbf(q, k)
 
-    # 4. Run Evaluation to Collect Distributions
     print("Extracting Key magnitudes over the validation set...")
     num_batches_to_sample = 10  # Limit batches to avoid running out of memory
 
@@ -110,7 +105,6 @@ def main():
     std_k_norms_flat = torch.cat(std_k_norms).numpy()
     rbf_k_norms_flat = torch.cat(rbf_k_norms).numpy()
 
-    # 5. Plot the Distributions
     print("Plotting distributions...")
     plt.figure(figsize=(10, 6))
 
