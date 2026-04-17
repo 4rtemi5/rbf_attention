@@ -11,10 +11,10 @@ from einops import rearrange
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
 
-def _get_autotune_configs():
+def _get_fwd_autotune_configs():
     configs = []
-    # Restrict to num_stages=2, 3 to prevent register spilling in heavy backward kernels
-    for num_stages in [2, 3]:
+    # Forward passes use fewer registers, can safely use 3-5 stages to hide latency
+    for num_stages in [3, 4, 5]:
         for block_m, block_n, num_warps in [
             (128, 128, 8),
             (128, 64, 4),
@@ -33,61 +33,28 @@ def _get_autotune_configs():
     return configs
 
 
-# =========================================================================
-# HELPER TRITON KERNEL (Zero-Allocation VRAM Fix)
-# =========================================================================
-
-
-@triton.jit
-def _sq_norm_kernel(
-    X,
-    SQ,
-    sm_scale,
-    stride_xz,
-    stride_xh,
-    stride_xn,
-    stride_sz,
-    stride_sh,
-    Z,
-    H,
-    N_CTX,
-    D_HEAD: tl.constexpr,
-    BLOCK_DMODEL: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-):
-    start_n = tl.program_id(0) * BLOCK_N
-    off_hz = tl.program_id(1)
-
-    off_z = off_hz // H
-    off_h = off_hz % H
-
-    offs_n = start_n + tl.arange(0, BLOCK_N)
-    offs_d = tl.arange(0, BLOCK_DMODEL)
-
-    x_ptrs = (
-        X
-        + off_z * stride_xz
-        + off_h * stride_xh
-        + offs_n[:, None] * stride_xn
-        + offs_d[None, :]
-    )
-    mask_n = offs_n < N_CTX
-
-    if BLOCK_DMODEL == D_HEAD:
-        x = tl.load(x_ptrs, mask=mask_n[:, None], other=0.0)
-    else:
-        x = tl.load(
-            x_ptrs, mask=mask_n[:, None] & (offs_d[None, :] < D_HEAD), other=0.0
-        )
-
-    x_f32 = x.to(tl.float32)
-    sq = tl.sum(x_f32 * x_f32, axis=1)
-
-    sq_casted = sq.to(X.dtype.element_ty).to(tl.float32)
-    sq_scaled = sq_casted * sm_scale
-
-    sq_ptrs = SQ + off_z * stride_sz + off_h * stride_sh + offs_n
-    tl.store(sq_ptrs, sq_scaled, mask=mask_n)
+def _get_bwd_autotune_configs():
+    configs = []
+    # 128x128 halves HBM memory reads. With our register-dropping tricks, it now perfectly fits!
+    for num_stages in [1, 2]:
+        for block_m, block_n, num_warps in [
+            (128, 128, 8),
+            (128, 64, 4),
+            (128, 64, 8),
+            (64, 128, 4),
+            (64, 128, 8),
+            (64, 64, 4),
+            (32, 64, 2),
+            (64, 32, 2),
+        ]:
+            configs.append(
+                triton.Config(
+                    {"BLOCK_M": block_m, "BLOCK_N": block_n},
+                    num_warps=num_warps,
+                    num_stages=num_stages,
+                )
+            )
+    return configs
 
 
 # =========================================================================
@@ -95,13 +62,12 @@ def _sq_norm_kernel(
 # =========================================================================
 
 
-@triton.autotune(configs=_get_autotune_configs(), key=["N_CTX"])
+@triton.autotune(configs=_get_fwd_autotune_configs(), key=["N_CTX"])
 @triton.jit
 def _rbf_attn_fwd_kernel(
     Q,
     K,
     V,
-    K_sq,
     sm_scale,
     Out,
     L,
@@ -114,8 +80,6 @@ def _rbf_attn_fwd_kernel(
     stride_vz,
     stride_vh,
     stride_vn,
-    stride_ksqz,
-    stride_ksqh,
     stride_oz,
     stride_oh,
     stride_om,
@@ -128,7 +92,14 @@ def _rbf_attn_fwd_kernel(
     IS_CAUSAL: tl.constexpr,
     D_HEAD: tl.constexpr,
 ):
-    start_m = tl.program_id(0)
+    start_m_linear = tl.program_id(0)
+    # STRAGGLER FIX: Schedule the heaviest causal blocks first!
+    start_m = (
+        ((N_CTX + BLOCK_M - 1) // BLOCK_M) - 1 - start_m_linear
+        if IS_CAUSAL
+        else start_m_linear
+    )
+
     off_hz = tl.program_id(1)
     off_z = off_hz // H
     off_h = off_hz % H
@@ -158,7 +129,6 @@ def _rbf_attn_fwd_kernel(
         + offs_n[:, None] * stride_vn
         + offs_d[None, :]
     )
-    k_sq_ptrs = K_sq + off_z * stride_ksqz + off_h * stride_ksqh + offs_n
     o_ptrs = (
         Out
         + off_z * stride_oz
@@ -175,7 +145,12 @@ def _rbf_attn_fwd_kernel(
             q_ptrs, mask=mask_m[:, None] & (offs_d[None, :] < D_HEAD), other=0.0
         )
 
-    m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    # MATH HOISTING: Bake the scaling and log2 conversions directly into Q
+    LOG2_E = 1.4426950408889634
+    sm_scale_log2 = sm_scale * LOG2_E
+    q = (q * (2.0 * sm_scale_log2)).to(q.dtype)
+
+    m_i_log2 = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
 
@@ -184,7 +159,6 @@ def _rbf_attn_fwd_kernel(
 
     k_ptrs += lo * stride_kn
     v_ptrs += lo * stride_vn
-    k_sq_ptrs += lo
 
     for start_n in range(lo, hi, BLOCK_N):
         curr_offs_n = start_n + offs_n
@@ -201,35 +175,34 @@ def _rbf_attn_fwd_kernel(
                 v_ptrs, mask=mask_n[:, None] & (offs_d[None, :] < D_HEAD), other=0.0
             )
 
-        k_sq_scaled = tl.load(k_sq_ptrs, mask=mask_n, other=0.0)
+        k_f32 = k.to(tl.float32)
+        k_sq_log2 = tl.sum(k_f32 * k_f32, axis=1) * sm_scale_log2
 
+        # Eliminates ALL scalar math inside the inner loop completely!
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         qk += tl.dot(q, tl.trans(k))
-
-        logits = qk * (2.0 * sm_scale) - k_sq_scaled[None, :]
+        qk -= k_sq_log2[None, :]
 
         if IS_CAUSAL and start_m * BLOCK_M < start_n + BLOCK_N:
-            logits = tl.where(
-                offs_m[:, None] >= curr_offs_n[None, :], logits, float("-inf")
-            )
+            qk = tl.where(offs_m[:, None] >= curr_offs_n[None, :], qk, float("-inf"))
         if start_n + BLOCK_N > N_CTX:
-            logits = tl.where(curr_offs_n[None, :] < N_CTX, logits, float("-inf"))
+            qk = tl.where(curr_offs_n[None, :] < N_CTX, qk, float("-inf"))
 
-        logits = logits.to(tl.float32)
-        m_ij = tl.maximum(m_i, tl.max(logits, 1))
+        m_ij_log2 = tl.maximum(m_i_log2, tl.max(qk, 1))
+        qk -= m_ij_log2[:, None]
 
-        p = tl.math.exp(logits - m_ij[:, None])
+        p = tl.math.exp2(qk)
         l_ij = tl.sum(p, 1)
-        alpha = tl.math.exp(m_i - m_ij)
+
+        alpha = tl.math.exp2(m_i_log2 - m_ij_log2)
         l_i = l_i * alpha + l_ij
 
         acc = acc * alpha[:, None]
         acc += tl.dot(p.to(V.dtype.element_ty), v)
-        m_i = m_ij
+        m_i_log2 = m_ij_log2
 
         k_ptrs += BLOCK_N * stride_kn
         v_ptrs += BLOCK_N * stride_vn
-        k_sq_ptrs += BLOCK_N
 
     acc = acc / l_i[:, None]
     if BLOCK_DMODEL == D_HEAD:
@@ -242,8 +215,8 @@ def _rbf_attn_fwd_kernel(
         )
 
     if L is not None:
-        l_ptrs = L + off_hz * N_CTX + offs_m
-        tl.store(l_ptrs, m_i + tl.math.log(l_i), mask=mask_m)
+        # Store L perfectly natively in base-2 Log Space
+        tl.store(L + off_hz * N_CTX + offs_m, m_i_log2 + tl.math.log2(l_i), mask=mask_m)
 
 
 @triton.jit
@@ -303,13 +276,12 @@ def _bwd_preprocess(
     tl.store(Delta + off_hz * N_CTX + offs_m, delta.to(tl.float32), mask=mask_m)
 
 
-@triton.autotune(configs=_get_autotune_configs(), key=["N_CTX"])
+@triton.autotune(configs=_get_bwd_autotune_configs(), key=["N_CTX"])
 @triton.jit
 def _rbf_attn_bwd_dk_dv_kernel(
     Q,
     K,
     V,
-    K_sq,
     sm_scale,
     DO,
     DK,
@@ -325,8 +297,15 @@ def _rbf_attn_bwd_dk_dv_kernel(
     stride_vz,
     stride_vh,
     stride_vn,
-    stride_ksqz,
-    stride_ksqh,
+    stride_doz,
+    stride_doh,
+    stride_dom,
+    stride_dkz,
+    stride_dkh,
+    stride_dkn,
+    stride_dvz,
+    stride_dvh,
+    stride_dvn,
     Z,
     H,
     N_CTX,
@@ -360,7 +339,6 @@ def _rbf_attn_bwd_dk_dv_kernel(
         + offs_n[:, None] * stride_vn
         + offs_d[None, :]
     )
-    k_sq_ptrs = K_sq + off_z * stride_ksqz + off_h * stride_ksqh + offs_n
 
     mask_n = offs_n < N_CTX
     if BLOCK_DMODEL == D_HEAD:
@@ -374,11 +352,16 @@ def _rbf_attn_bwd_dk_dv_kernel(
             v_ptrs, mask=mask_n[:, None] & (offs_d[None, :] < D_HEAD), other=0.0
         )
 
-    k_sq_scaled = tl.load(k_sq_ptrs, mask=mask_n, other=0.0)
-    k_f32 = k.to(tl.float32)
+    # MATH HOISTING
+    LOG2_E = 1.4426950408889634
+    sm_scale_log2 = sm_scale * LOG2_E
+    k_sq_log2 = tl.sum(k.to(tl.float32) * k.to(tl.float32), axis=1) * sm_scale_log2
+
+    # Overwrite K in place so the compiler knows to drop it
+    k = (k * (2.0 * sm_scale_log2)).to(k.dtype)
 
     dk_dot = tl.zeros([BLOCK_N, BLOCK_DMODEL], dtype=tl.float32)
-    ds_scaled_sum_k_acc = tl.zeros([BLOCK_N], dtype=tl.float32)
+    ds_sum_acc = tl.zeros([BLOCK_N], dtype=tl.float32)
     dv = tl.zeros([BLOCK_N, BLOCK_DMODEL], dtype=tl.float32)
 
     lo = (start_n_idx // BLOCK_M) * BLOCK_M if IS_CAUSAL else 0
@@ -392,16 +375,16 @@ def _rbf_attn_bwd_dk_dv_kernel(
     )
     do_ptrs = (
         DO
-        + off_z * stride_qz
-        + off_h * stride_qh
-        + offs_m[:, None] * stride_qm
+        + off_z * stride_doz
+        + off_h * stride_doh
+        + offs_m[:, None] * stride_dom
         + offs_d[None, :]
     )
     l_ptrs = L + off_hz * N_CTX + offs_m
     delta_ptrs = Delta + off_hz * N_CTX + offs_m
 
     q_ptrs += lo * stride_qm
-    do_ptrs += lo * stride_qm
+    do_ptrs += lo * stride_dom
     l_ptrs += lo
     delta_ptrs += lo
 
@@ -420,57 +403,61 @@ def _rbf_attn_bwd_dk_dv_kernel(
                 do_ptrs, mask=mask_m[:, None] & (offs_d[None, :] < D_HEAD), other=0.0
             )
 
-        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        qk += tl.dot(q, tl.trans(k))
-        logits = qk * (2.0 * sm_scale) - k_sq_scaled[None, :]
+        qk_T = tl.zeros([BLOCK_N, BLOCK_M], dtype=tl.float32)
+        qk_T += tl.dot(k, tl.trans(q))
+        qk_T -= k_sq_log2[:, None]
 
         if IS_CAUSAL and start_m < start_n_idx + BLOCK_N:
-            logits = tl.where(
-                curr_offs_m[:, None] >= offs_n[None, :], logits, float("-inf")
+            qk_T = tl.where(
+                offs_n[:, None] <= curr_offs_m[None, :], qk_T, float("-inf")
             )
         if start_m + BLOCK_M > N_CTX or start_n_idx + BLOCK_N > N_CTX:
-            logits = tl.where(mask_m[:, None] & mask_n[None, :], logits, float("-inf"))
+            qk_T = tl.where(mask_n[:, None] & mask_m[None, :], qk_T, float("-inf"))
 
-        logits = logits.to(tl.float32)
-        l_i = tl.load(l_ptrs, mask=mask_m, other=0.0)
-        p = tl.math.exp(logits - l_i[:, None])
+        # Pure base-2 loads!
+        l_i_log2 = tl.load(l_ptrs, mask=mask_m, other=0.0)
+        qk_T -= l_i_log2[None, :]
+        p_T = tl.math.exp2(qk_T)
 
-        dv += tl.dot(tl.trans(p.to(V.dtype.element_ty)), do)
+        dv += tl.dot(p_T.to(V.dtype.element_ty), do)
 
-        dp = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        dp += tl.dot(do, tl.trans(v))
-
+        dp_T = tl.zeros([BLOCK_N, BLOCK_M], dtype=tl.float32)
+        dp_T += tl.dot(v, tl.trans(do))
         delta = tl.load(delta_ptrs, mask=mask_m, other=0.0)
 
-        d_logits = p * (dp - delta[:, None])
-        ds_scaled = d_logits * (2.0 * sm_scale)
-        ds_scaled_f16 = ds_scaled.to(Q.dtype.element_ty)
+        dp_T -= delta[None, :]
+        dp_T *= p_T
 
-        ds_scaled_sum_k_acc += tl.sum(ds_scaled_f16.to(tl.float32), axis=0)
-        dk_dot += tl.dot(tl.trans(ds_scaled_f16), q)
+        ds_sum_acc += tl.sum(dp_T, axis=1)
+        dk_dot += tl.dot(dp_T.to(Q.dtype.element_ty), q)
 
         q_ptrs += BLOCK_M * stride_qm
-        do_ptrs += BLOCK_M * stride_qm
+        do_ptrs += BLOCK_M * stride_dom
         l_ptrs += BLOCK_M
         delta_ptrs += BLOCK_M
 
-    dk_dot_f16 = dk_dot.to(K.dtype.element_ty).to(tl.float32)
-    d_k_sq_f16 = ds_scaled_sum_k_acc.to(K.dtype.element_ty).to(tl.float32)
+    # Reload the Unscaled K at the end! This allowed us to free massive registers inside the loop!
+    if BLOCK_DMODEL == D_HEAD:
+        k_orig = tl.load(k_ptrs, mask=mask_n[:, None], other=0.0)
+    else:
+        k_orig = tl.load(
+            k_ptrs, mask=mask_n[:, None] & (offs_d[None, :] < D_HEAD), other=0.0
+        )
 
-    dk = dk_dot_f16 - d_k_sq_f16[:, None] * k_f32
+    dk = (dk_dot - ds_sum_acc[:, None] * k_orig.to(tl.float32)) * (2.0 * sm_scale)
 
     dk_ptrs = (
         DK
-        + off_z * stride_kz
-        + off_h * stride_kh
-        + offs_n[:, None] * stride_kn
+        + off_z * stride_dkz
+        + off_h * stride_dkh
+        + offs_n[:, None] * stride_dkn
         + offs_d[None, :]
     )
     dv_ptrs = (
         DV
-        + off_z * stride_vz
-        + off_h * stride_vh
-        + offs_n[:, None] * stride_vn
+        + off_z * stride_dvz
+        + off_h * stride_dvh
+        + offs_n[:, None] * stride_dvn
         + offs_d[None, :]
     )
 
@@ -490,13 +477,12 @@ def _rbf_attn_bwd_dk_dv_kernel(
         )
 
 
-@triton.autotune(configs=_get_autotune_configs(), key=["N_CTX"])
+@triton.autotune(configs=_get_bwd_autotune_configs(), key=["N_CTX"])
 @triton.jit
 def _rbf_attn_bwd_dq_kernel(
     Q,
     K,
     V,
-    K_sq,
     sm_scale,
     DO,
     DQ,
@@ -511,8 +497,12 @@ def _rbf_attn_bwd_dq_kernel(
     stride_vz,
     stride_vh,
     stride_vn,
-    stride_ksqz,
-    stride_ksqh,
+    stride_doz,
+    stride_doh,
+    stride_dom,
+    stride_dqz,
+    stride_dqh,
+    stride_dqm,
     Z,
     H,
     N_CTX,
@@ -522,7 +512,14 @@ def _rbf_attn_bwd_dq_kernel(
     IS_CAUSAL: tl.constexpr,
     D_HEAD: tl.constexpr,
 ):
-    start_m = tl.program_id(0)
+    start_m_linear = tl.program_id(0)
+    # STRAGGLER FIX
+    start_m = (
+        ((N_CTX + BLOCK_M - 1) // BLOCK_M) - 1 - start_m_linear
+        if IS_CAUSAL
+        else start_m_linear
+    )
+
     off_hz = tl.program_id(1)
     off_z = off_hz // H
     off_h = off_hz % H
@@ -541,9 +538,9 @@ def _rbf_attn_bwd_dq_kernel(
     )
     do_ptrs = (
         DO
-        + off_z * stride_qz
-        + off_h * stride_qh
-        + offs_m[:, None] * stride_qm
+        + off_z * stride_doz
+        + off_h * stride_doh
+        + offs_m[:, None] * stride_dom
         + offs_d[None, :]
     )
 
@@ -559,7 +556,11 @@ def _rbf_attn_bwd_dq_kernel(
             do_ptrs, mask=mask_m[:, None] & (offs_d[None, :] < D_HEAD), other=0.0
         )
 
-    l_i = tl.load(L + off_hz * N_CTX + offs_m, mask=mask_m, other=0.0)
+    LOG2_E = 1.4426950408889634
+    sm_scale_log2 = sm_scale * LOG2_E
+    q = (q * (2.0 * sm_scale_log2)).to(q.dtype)
+
+    l_i_log2 = tl.load(L + off_hz * N_CTX + offs_m, mask=mask_m, other=0.0)
     delta = tl.load(Delta + off_hz * N_CTX + offs_m, mask=mask_m, other=0.0)
 
     dq_acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
@@ -580,7 +581,6 @@ def _rbf_attn_bwd_dq_kernel(
         + offs_n[:, None] * stride_vn
         + offs_d[None, :]
     )
-    k_sq_ptrs = K_sq + off_z * stride_ksqz + off_h * stride_ksqh + offs_n
 
     for start_n in range(0, hi, BLOCK_N):
         curr_offs_n = start_n + offs_n
@@ -597,96 +597,74 @@ def _rbf_attn_bwd_dq_kernel(
                 v_ptrs, mask=mask_n[:, None] & (offs_d[None, :] < D_HEAD), other=0.0
             )
 
-        k_sq_scaled = tl.load(k_sq_ptrs, mask=mask_n, other=0.0)
+        k_f32 = k.to(tl.float32)
+        k_sq_log2 = tl.sum(k_f32 * k_f32, axis=1) * sm_scale_log2
 
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         qk += tl.dot(q, tl.trans(k))
-        logits = qk * (2.0 * sm_scale) - k_sq_scaled[None, :]
+        qk -= k_sq_log2[None, :]
 
         if IS_CAUSAL and start_m_idx < start_n + BLOCK_N:
-            logits = tl.where(
-                offs_m[:, None] >= curr_offs_n[None, :], logits, float("-inf")
-            )
+            qk = tl.where(offs_m[:, None] >= curr_offs_n[None, :], qk, float("-inf"))
         if start_m_idx + BLOCK_M > N_CTX or start_n + BLOCK_N > N_CTX:
-            logits = tl.where(mask_m[:, None] & mask_n[None, :], logits, float("-inf"))
+            qk = tl.where(mask_m[:, None] & mask_n[None, :], qk, float("-inf"))
 
-        logits = logits.to(tl.float32)
-        p = tl.math.exp(logits - l_i[:, None])
+        qk -= l_i_log2[:, None]
+        p = tl.math.exp2(qk)
 
         dp = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         dp += tl.dot(do, tl.trans(v))
 
-        d_logits = p * (dp - delta[:, None])
-        ds_scaled = d_logits * (2.0 * sm_scale)
-        ds_scaled_f16 = ds_scaled.to(Q.dtype.element_ty)
+        dp -= delta[:, None]
+        dp *= p
 
-        dq_acc += tl.dot(ds_scaled_f16, k)
+        dq_acc += tl.dot(dp.to(Q.dtype.element_ty), k)
 
         k_ptrs += BLOCK_N * stride_kn
         v_ptrs += BLOCK_N * stride_vn
-        k_sq_ptrs += BLOCK_N
+
+    dq = dq_acc * (2.0 * sm_scale)
 
     dq_ptrs = (
         DQ
-        + off_z * stride_qz
-        + off_h * stride_qh
-        + offs_m[:, None] * stride_qm
+        + off_z * stride_dqz
+        + off_h * stride_dqh
+        + offs_m[:, None] * stride_dqm
         + offs_d[None, :]
     )
     if BLOCK_DMODEL == D_HEAD:
-        tl.store(dq_ptrs, dq_acc.to(DQ.dtype.element_ty), mask=mask_m[:, None])
+        tl.store(dq_ptrs, dq.to(DQ.dtype.element_ty), mask=mask_m[:, None])
     else:
         tl.store(
             dq_ptrs,
-            dq_acc.to(DQ.dtype.element_ty),
+            dq.to(DQ.dtype.element_ty),
             mask=mask_m[:, None] & (offs_d[None, :] < D_HEAD),
         )
 
 
 # =========================================================================
 # TORCH.LIBRARY CUSTOM OP MIGRATION (PyTorch 2.4+ Native Fusion)
+# BUST CACHE: Migrated to v5 to invalidate previous stale graphs
 # =========================================================================
 
 
-# --- 1. Scaled RBF Attention ---
-@torch.library.custom_op("rbf_attn::scaled_fwd", mutates_args=())
+@torch.library.custom_op("rbf_attn_v5::scaled_fwd", mutates_args=())
 def rbf_scaled_fwd(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, is_causal: bool
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+) -> tuple[torch.Tensor, torch.Tensor]:
     B, H, N_CTX, D_HEAD = q.shape
 
-    out = torch.empty_like(q)
-    L = q.new_empty((B, H, N_CTX), dtype=torch.float32)
-    k_sq_scaled = q.new_empty((B, H, N_CTX), dtype=torch.float32)
+    out = torch.empty_like(q, memory_format=torch.contiguous_format)
+    L = torch.empty((B, H, N_CTX), device=q.device, dtype=torch.float32)
 
     sm_scale = 1.0 / math.sqrt(D_HEAD)
     BLOCK_DMODEL = max(16, triton.next_power_of_2(D_HEAD))
-
-    grid_sq = (triton.cdiv(N_CTX, 128), B * H, 1)
-    _sq_norm_kernel[grid_sq](
-        k,
-        k_sq_scaled,
-        sm_scale,
-        k.stride(0),
-        k.stride(1),
-        k.stride(2),
-        k_sq_scaled.stride(0),
-        k_sq_scaled.stride(1),
-        B,
-        H,
-        N_CTX,
-        D_HEAD=D_HEAD,
-        BLOCK_DMODEL=BLOCK_DMODEL,
-        BLOCK_N=128,
-    )
 
     grid = lambda meta: (triton.cdiv(N_CTX, meta["BLOCK_M"]), B * H, 1)  # noqa: E731
     _rbf_attn_fwd_kernel[grid](
         q,
         k,
         v,
-        k_sq_scaled,
         sm_scale,
         out,
         L,
@@ -699,8 +677,6 @@ def rbf_scaled_fwd(
         v.stride(0),
         v.stride(1),
         v.stride(2),
-        k_sq_scaled.stride(0),
-        k_sq_scaled.stride(1),
         out.stride(0),
         out.stride(1),
         out.stride(2),
@@ -711,45 +687,35 @@ def rbf_scaled_fwd(
         IS_CAUSAL=is_causal,
         D_HEAD=D_HEAD,
     )
-    return out, L, k_sq_scaled
+    return out, L
 
 
 @rbf_scaled_fwd.register_fake
 def _(q, k, v, is_causal):
     B, H, N_CTX, D_HEAD = q.shape
     return (
-        # FIX 1: Use .new_empty() to predict contiguous strides,
-        # instead of empty_like() which inherits non-contiguous strides.
-        q.new_empty(q.shape),
-        q.new_empty((B, H, N_CTX), dtype=torch.float32),
-        k.new_empty((B, H, N_CTX), dtype=torch.float32),
+        torch.empty_like(q, memory_format=torch.contiguous_format),
+        torch.empty((B, H, N_CTX), device=q.device, dtype=torch.float32),
     )
 
 
-@torch.library.custom_op("rbf_attn::scaled_bwd", mutates_args=())
+@torch.library.custom_op("rbf_attn_v5::scaled_bwd", mutates_args=())
 def rbf_scaled_bwd(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     out: torch.Tensor,
     L: torch.Tensor,
-    k_sq_scaled: torch.Tensor,
     dout: torch.Tensor,
     is_causal: bool,
     sm_scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # FIX 2: Ensure all tensors are completely contiguous!
-    # The backward kernels use `stride_qz` to index into `DO`, meaning
-    # Q and DO must have perfectly identical memory alignments.
-    q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
-    out, dout = out.contiguous(), dout.contiguous()
-
     B, H, N_CTX, D_HEAD = q.shape
 
     PREPROCESS_BLOCK_M = 64
     BLOCK_DMODEL = max(16, triton.next_power_of_2(D_HEAD))
 
-    Delta = q.new_empty((B, H, N_CTX), dtype=torch.float32)
+    Delta = torch.empty((B, H, N_CTX), device=q.device, dtype=torch.float32)
     _bwd_preprocess[(triton.cdiv(N_CTX, PREPROCESS_BLOCK_M), B * H, 1)](
         out,
         dout,
@@ -768,16 +734,15 @@ def rbf_scaled_bwd(
         D_HEAD=D_HEAD,
     )
 
-    dq = torch.empty_like(q)
-    dk = torch.empty_like(k)
-    dv = torch.empty_like(v)
+    dq = torch.empty_like(q, memory_format=torch.contiguous_format)
+    dk = torch.empty_like(k, memory_format=torch.contiguous_format)
+    dv = torch.empty_like(v, memory_format=torch.contiguous_format)
 
     grid_dk_dv = lambda meta: (triton.cdiv(N_CTX, meta["BLOCK_N"]), B * H, 1)  # noqa: E731
     _rbf_attn_bwd_dk_dv_kernel[grid_dk_dv](
         q,
         k,
         v,
-        k_sq_scaled,
         sm_scale,
         dout,
         dk,
@@ -793,8 +758,15 @@ def rbf_scaled_bwd(
         v.stride(0),
         v.stride(1),
         v.stride(2),
-        k_sq_scaled.stride(0),
-        k_sq_scaled.stride(1),
+        dout.stride(0),
+        dout.stride(1),
+        dout.stride(2),
+        dk.stride(0),
+        dk.stride(1),
+        dk.stride(2),
+        dv.stride(0),
+        dv.stride(1),
+        dv.stride(2),
         B,
         H,
         N_CTX,
@@ -808,7 +780,6 @@ def rbf_scaled_bwd(
         q,
         k,
         v,
-        k_sq_scaled,
         sm_scale,
         dout,
         dq,
@@ -823,8 +794,12 @@ def rbf_scaled_bwd(
         v.stride(0),
         v.stride(1),
         v.stride(2),
-        k_sq_scaled.stride(0),
-        k_sq_scaled.stride(1),
+        dout.stride(0),
+        dout.stride(1),
+        dout.stride(2),
+        dq.stride(0),
+        dq.stride(1),
+        dq.stride(2),
         B,
         H,
         N_CTX,
@@ -836,28 +811,34 @@ def rbf_scaled_bwd(
 
 
 @rbf_scaled_bwd.register_fake
-def _(q, k, v, out, L, k_sq_scaled, dout, is_causal, sm_scale):
-    return q.new_empty(q.shape), k.new_empty(k.shape), v.new_empty(v.shape)
+def _(q, k, v, out, L, dout, is_causal, sm_scale):
+    return (
+        torch.empty_like(q, memory_format=torch.contiguous_format),
+        torch.empty_like(k, memory_format=torch.contiguous_format),
+        torch.empty_like(v, memory_format=torch.contiguous_format),
+    )
 
 
 def rbf_scaled_setup_context(ctx, inputs, output):
     q, k, v, is_causal = inputs
-    out, L, k_sq_scaled = output
-    ctx.save_for_backward(q, k, v, out, L, k_sq_scaled)
+    out, L = output
+    ctx.save_for_backward(q, k, v, out, L)
     ctx.is_causal = is_causal
     ctx.sm_scale = 1.0 / math.sqrt(q.shape[-1])
 
 
-def rbf_scaled_backward(ctx, dout, dL, dk_sq_scaled):
-    q, k, v, out, L, k_sq_scaled = ctx.saved_tensors
-    dq, dk, dv = torch.ops.rbf_attn.scaled_bwd(
-        q, k, v, out, L, k_sq_scaled, dout, ctx.is_causal, ctx.sm_scale
+def rbf_scaled_backward(ctx, dout, dL):
+    q, k, v, out, L = ctx.saved_tensors
+    dq, dk, dv = torch.ops.rbf_attn_v5.scaled_bwd(
+        q, k, v, out, L, dout, ctx.is_causal, ctx.sm_scale
     )
     return dq, dk, dv, None
 
 
 torch.library.register_autograd(
-    "rbf_attn::scaled_fwd", rbf_scaled_backward, setup_context=rbf_scaled_setup_context
+    "rbf_attn_v5::scaled_fwd",
+    rbf_scaled_backward,
+    setup_context=rbf_scaled_setup_context,
 )
 
 
@@ -865,238 +846,24 @@ torch.library.register_autograd(
 # Clean Python Wrappers
 # -------------------------------------------------------------------------
 def run_triton_rbf(q, k, v, is_causal=True):
-    return torch.ops.rbf_attn.scaled_fwd(q, k, v, is_causal)[0]
+    return torch.ops.rbf_attn_v5.scaled_fwd(q, k, v, is_causal)[0]
 
 
 def run_triton_non_softmax_rbf(q, k, v, is_causal=True):
-    return torch.ops.rbf_attn.non_softmax_fwd(q, k, v, is_causal)[0]
+    return torch.ops.rbf_attn_v5.non_softmax_fwd(q, k, v, is_causal)
 
 
 # =========================================================================
-# NON-SOFTMAX KERNELS & WRAPPERS
+# NON-SOFTMAX KERNELS
 # =========================================================================
 
 
-@torch.library.custom_op("rbf_attn::non_softmax_fwd", mutates_args=())
-def rbf_non_softmax_fwd(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, is_causal: bool
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
-    B, H, N_CTX, D_HEAD = q.shape
-    out = torch.empty_like(q)
-
-    sm_scale = 1.0 / math.sqrt(D_HEAD)
-    BLOCK_DMODEL = max(16, triton.next_power_of_2(D_HEAD))
-
-    q_sq_scaled = q.new_empty((B, H, N_CTX), dtype=torch.float32)
-    k_sq_scaled = k.new_empty((B, H, N_CTX), dtype=torch.float32)
-
-    grid_sq = (triton.cdiv(N_CTX, 128), B * H, 1)
-    _sq_norm_kernel[grid_sq](
-        q,
-        q_sq_scaled,
-        sm_scale,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        q_sq_scaled.stride(0),
-        q_sq_scaled.stride(1),
-        B,
-        H,
-        N_CTX,
-        D_HEAD=D_HEAD,
-        BLOCK_DMODEL=BLOCK_DMODEL,
-        BLOCK_N=128,
-    )
-    _sq_norm_kernel[grid_sq](
-        k,
-        k_sq_scaled,
-        sm_scale,
-        k.stride(0),
-        k.stride(1),
-        k.stride(2),
-        k_sq_scaled.stride(0),
-        k_sq_scaled.stride(1),
-        B,
-        H,
-        N_CTX,
-        D_HEAD=D_HEAD,
-        BLOCK_DMODEL=BLOCK_DMODEL,
-        BLOCK_N=128,
-    )
-
-    grid = lambda meta: (triton.cdiv(N_CTX, meta["BLOCK_M"]), B * H, 1)  # noqa: E731
-    _rbf_non_softmax_fwd_kernel[grid](
-        q,
-        k,
-        v,
-        q_sq_scaled,
-        k_sq_scaled,
-        sm_scale,
-        out,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        k.stride(0),
-        k.stride(1),
-        k.stride(2),
-        v.stride(0),
-        v.stride(1),
-        v.stride(2),
-        q_sq_scaled.stride(0),
-        q_sq_scaled.stride(1),
-        k_sq_scaled.stride(0),
-        k_sq_scaled.stride(1),
-        out.stride(0),
-        out.stride(1),
-        out.stride(2),
-        B,
-        H,
-        N_CTX,
-        BLOCK_DMODEL=BLOCK_DMODEL,
-        IS_CAUSAL=is_causal,
-        D_HEAD=D_HEAD,
-    )
-    return out, q_sq_scaled, k_sq_scaled
-
-
-@rbf_non_softmax_fwd.register_fake
-def _(q, k, v, is_causal):
-    B, H, N_CTX, D_HEAD = q.shape
-    return (
-        q.new_empty(q.shape),
-        q.new_empty((B, H, N_CTX), dtype=torch.float32),
-        k.new_empty((B, H, N_CTX), dtype=torch.float32),
-    )
-
-
-@torch.library.custom_op("rbf_attn::non_softmax_bwd", mutates_args=())
-def rbf_non_softmax_bwd(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    q_sq_scaled: torch.Tensor,
-    k_sq_scaled: torch.Tensor,
-    dout: torch.Tensor,
-    is_causal: bool,
-    sm_scale: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # Ensure backward alignments match exactly
-    q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
-    dout = dout.contiguous()
-
-    B, H, N_CTX, D_HEAD = q.shape
-
-    BLOCK_DMODEL = max(16, triton.next_power_of_2(D_HEAD))
-    dq = torch.empty_like(q)
-    dk = torch.empty_like(k)
-    dv = torch.empty_like(v)
-
-    grid_dk_dv = lambda meta: (triton.cdiv(N_CTX, meta["BLOCK_N"]), B * H, 1)  # noqa: E731
-    _rbf_non_softmax_bwd_dk_dv_kernel[grid_dk_dv](
-        q,
-        k,
-        v,
-        q_sq_scaled,
-        k_sq_scaled,
-        sm_scale,
-        dout,
-        dk,
-        dv,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        k.stride(0),
-        k.stride(1),
-        k.stride(2),
-        v.stride(0),
-        v.stride(1),
-        v.stride(2),
-        q_sq_scaled.stride(0),
-        q_sq_scaled.stride(1),
-        k_sq_scaled.stride(0),
-        k_sq_scaled.stride(1),
-        B,
-        H,
-        N_CTX,
-        BLOCK_DMODEL=BLOCK_DMODEL,
-        IS_CAUSAL=is_causal,
-        D_HEAD=D_HEAD,
-    )
-
-    grid_dq = lambda meta: (triton.cdiv(N_CTX, meta["BLOCK_M"]), B * H, 1)  # noqa: E731
-    _rbf_non_softmax_bwd_dq_kernel[grid_dq](
-        q,
-        k,
-        v,
-        q_sq_scaled,
-        k_sq_scaled,
-        sm_scale,
-        dout,
-        dq,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        k.stride(0),
-        k.stride(1),
-        k.stride(2),
-        v.stride(0),
-        v.stride(1),
-        v.stride(2),
-        q_sq_scaled.stride(0),
-        q_sq_scaled.stride(1),
-        k_sq_scaled.stride(0),
-        k_sq_scaled.stride(1),
-        B,
-        H,
-        N_CTX,
-        BLOCK_DMODEL=BLOCK_DMODEL,
-        IS_CAUSAL=is_causal,
-        D_HEAD=D_HEAD,
-    )
-    return dq, dk, dv
-
-
-@rbf_non_softmax_bwd.register_fake
-def _(q, k, v, q_sq_scaled, k_sq_scaled, dout, is_causal, sm_scale):
-    return q.new_empty(q.shape), k.new_empty(k.shape), v.new_empty(v.shape)
-
-
-def rbf_non_softmax_setup_context(ctx, inputs, output):
-    q, k, v, is_causal = inputs
-    out, q_sq_scaled, k_sq_scaled = output
-    ctx.save_for_backward(q, k, v, q_sq_scaled, k_sq_scaled)
-    ctx.is_causal = is_causal
-    ctx.sm_scale = 1.0 / math.sqrt(q.shape[-1])
-
-
-def rbf_non_softmax_backward(ctx, dout, dq_sq, dk_sq):
-    q, k, v, q_sq_scaled, k_sq_scaled = ctx.saved_tensors
-    dq, dk, dv = torch.ops.rbf_attn.non_softmax_bwd(
-        q, k, v, q_sq_scaled, k_sq_scaled, dout, ctx.is_causal, ctx.sm_scale
-    )
-    return dq, dk, dv, None
-
-
-torch.library.register_autograd(
-    "rbf_attn::non_softmax_fwd",
-    rbf_non_softmax_backward,
-    setup_context=rbf_non_softmax_setup_context,
-)
-
-# =========================================================================
-# NON-SOFTMAX KERNELS & WRAPPERS
-# =========================================================================
-
-
-@triton.autotune(configs=_get_autotune_configs(), key=["N_CTX"])
+@triton.autotune(configs=_get_fwd_autotune_configs(), key=["N_CTX"])
 @triton.jit
 def _rbf_non_softmax_fwd_kernel(
     Q,
     K,
     V,
-    Q_sq,
-    K_sq,
     sm_scale,
     Out,
     stride_qz,
@@ -1108,10 +875,6 @@ def _rbf_non_softmax_fwd_kernel(
     stride_vz,
     stride_vh,
     stride_vn,
-    stride_qsqz,
-    stride_qsqh,
-    stride_ksqz,
-    stride_ksqh,
     stride_oz,
     stride_oh,
     stride_om,
@@ -1124,7 +887,12 @@ def _rbf_non_softmax_fwd_kernel(
     IS_CAUSAL: tl.constexpr,
     D_HEAD: tl.constexpr,
 ):
-    start_m = tl.program_id(0)
+    start_m_linear = tl.program_id(0)
+    start_m = (
+        ((N_CTX + BLOCK_M - 1) // BLOCK_M) - 1 - start_m_linear
+        if IS_CAUSAL
+        else start_m_linear
+    )
     off_hz = tl.program_id(1)
     off_z = off_hz // H
     off_h = off_hz % H
@@ -1147,7 +915,6 @@ def _rbf_non_softmax_fwd_kernel(
         + offs_m[:, None] * stride_om
         + offs_d[None, :]
     )
-    q_sq_ptrs = Q_sq + off_z * stride_qsqz + off_h * stride_qsqh + offs_m
 
     mask_m = offs_m < N_CTX
     if BLOCK_DMODEL == D_HEAD:
@@ -1157,7 +924,11 @@ def _rbf_non_softmax_fwd_kernel(
             q_ptrs, mask=mask_m[:, None] & (offs_d[None, :] < D_HEAD), other=0.0
         )
 
-    q_sq_scaled = tl.load(q_sq_ptrs, mask=mask_m, other=0.0)
+    LOG2_E = 1.4426950408889634
+    sm_scale_log2 = sm_scale * LOG2_E
+    q_sq_log2 = tl.sum(q.to(tl.float32) * q.to(tl.float32), axis=1) * sm_scale_log2
+    q = (q * (2.0 * sm_scale_log2)).to(q.dtype)
+
     acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
 
     lo = 0
@@ -1177,11 +948,9 @@ def _rbf_non_softmax_fwd_kernel(
         + offs_n[:, None] * stride_vn
         + offs_d[None, :]
     )
-    k_sq_ptrs = K_sq + off_z * stride_ksqz + off_h * stride_ksqh + offs_n
 
     k_ptrs += lo * stride_kn
     v_ptrs += lo * stride_vn
-    k_sq_ptrs += lo
 
     for start_n in range(lo, hi, BLOCK_N):
         curr_offs_n = start_n + offs_n
@@ -1198,26 +967,25 @@ def _rbf_non_softmax_fwd_kernel(
                 v_ptrs, mask=mask_n[:, None] & (offs_d[None, :] < D_HEAD), other=0.0
             )
 
-        k_sq_scaled = tl.load(k_sq_ptrs, mask=mask_n, other=0.0)
+        k_f32 = k.to(tl.float32)
+        k_sq_log2 = tl.sum(k_f32 * k_f32, axis=1) * sm_scale_log2
 
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         qk += tl.dot(q, tl.trans(k))
 
-        logits = qk * (2.0 * sm_scale) - q_sq_scaled[:, None] - k_sq_scaled[None, :]
+        qk -= q_sq_log2[:, None]
+        qk -= k_sq_log2[None, :]
 
         if IS_CAUSAL and start_m * BLOCK_M < start_n + BLOCK_N:
-            logits = tl.where(
-                offs_m[:, None] >= curr_offs_n[None, :], logits, float("-inf")
-            )
+            qk = tl.where(offs_m[:, None] >= curr_offs_n[None, :], qk, float("-inf"))
         if start_n + BLOCK_N > N_CTX or start_m * BLOCK_M + BLOCK_M > N_CTX:
-            logits = tl.where(mask_m[:, None] & mask_n[None, :], logits, float("-inf"))
+            qk = tl.where(mask_m[:, None] & mask_n[None, :], qk, float("-inf"))
 
-        p = tl.math.exp(logits)
+        p = tl.math.exp2(qk)
         acc += tl.dot(p.to(V.dtype.element_ty), v)
 
         k_ptrs += BLOCK_N * stride_kn
         v_ptrs += BLOCK_N * stride_vn
-        k_sq_ptrs += BLOCK_N
 
     if BLOCK_DMODEL == D_HEAD:
         tl.store(o_ptrs, acc.to(Out.dtype.element_ty), mask=mask_m[:, None])
@@ -1229,14 +997,12 @@ def _rbf_non_softmax_fwd_kernel(
         )
 
 
-@triton.autotune(configs=_get_autotune_configs(), key=["N_CTX"])
+@triton.autotune(configs=_get_bwd_autotune_configs(), key=["N_CTX"])
 @triton.jit
 def _rbf_non_softmax_bwd_dk_dv_kernel(
     Q,
     K,
     V,
-    Q_sq,
-    K_sq,
     sm_scale,
     DO,
     DK,
@@ -1250,10 +1016,15 @@ def _rbf_non_softmax_bwd_dk_dv_kernel(
     stride_vz,
     stride_vh,
     stride_vn,
-    stride_qsqz,
-    stride_qsqh,
-    stride_ksqz,
-    stride_ksqh,
+    stride_doz,
+    stride_doh,
+    stride_dom,
+    stride_dkz,
+    stride_dkh,
+    stride_dkn,
+    stride_dvz,
+    stride_dvh,
+    stride_dvn,
     Z,
     H,
     N_CTX,
@@ -1287,7 +1058,6 @@ def _rbf_non_softmax_bwd_dk_dv_kernel(
         + offs_n[:, None] * stride_vn
         + offs_d[None, :]
     )
-    k_sq_ptrs = K_sq + off_z * stride_ksqz + off_h * stride_ksqh + offs_n
 
     mask_n = offs_n < N_CTX
     if BLOCK_DMODEL == D_HEAD:
@@ -1301,8 +1071,10 @@ def _rbf_non_softmax_bwd_dk_dv_kernel(
             v_ptrs, mask=mask_n[:, None] & (offs_d[None, :] < D_HEAD), other=0.0
         )
 
-    k_sq_scaled = tl.load(k_sq_ptrs, mask=mask_n, other=0.0)
-    k_f32 = k.to(tl.float32)
+    LOG2_E = 1.4426950408889634
+    sm_scale_log2 = sm_scale * LOG2_E
+    k_sq_log2 = tl.sum(k.to(tl.float32) * k.to(tl.float32), axis=1) * sm_scale_log2
+    k = (k * (2.0 * sm_scale_log2)).to(k.dtype)
 
     dk_dot = tl.zeros([BLOCK_N, BLOCK_DMODEL], dtype=tl.float32)
     S_colsum_acc = tl.zeros([BLOCK_N], dtype=tl.float32)
@@ -1319,16 +1091,14 @@ def _rbf_non_softmax_bwd_dk_dv_kernel(
     )
     do_ptrs = (
         DO
-        + off_z * stride_qz
-        + off_h * stride_qh
-        + offs_m[:, None] * stride_qm
+        + off_z * stride_doz
+        + off_h * stride_doh
+        + offs_m[:, None] * stride_dom
         + offs_d[None, :]
     )
-    q_sq_ptrs = Q_sq + off_z * stride_qsqz + off_h * stride_qsqh + offs_m
 
     q_ptrs += lo * stride_qm
-    do_ptrs += lo * stride_qm
-    q_sq_ptrs += lo
+    do_ptrs += lo * stride_dom
 
     for start_m in range(lo, N_CTX, BLOCK_M):
         curr_offs_m = start_m + offs_m
@@ -1345,55 +1115,56 @@ def _rbf_non_softmax_bwd_dk_dv_kernel(
                 do_ptrs, mask=mask_m[:, None] & (offs_d[None, :] < D_HEAD), other=0.0
             )
 
-        q_sq_scaled = tl.load(q_sq_ptrs, mask=mask_m, other=0.0)
+        q_sq_log2 = tl.sum(q.to(tl.float32) * q.to(tl.float32), axis=1) * sm_scale_log2
 
-        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        qk += tl.dot(q, tl.trans(k))
+        qk_T = tl.zeros([BLOCK_N, BLOCK_M], dtype=tl.float32)
+        qk_T += tl.dot(k, tl.trans(q))
 
-        logits = qk * (2.0 * sm_scale) - q_sq_scaled[:, None] - k_sq_scaled[None, :]
+        qk_T -= q_sq_log2[None, :]
+        qk_T -= k_sq_log2[:, None]
 
         if IS_CAUSAL and start_m < start_n_idx + BLOCK_N:
-            logits = tl.where(
-                curr_offs_m[:, None] >= offs_n[None, :], logits, float("-inf")
+            qk_T = tl.where(
+                offs_n[:, None] <= curr_offs_m[None, :], qk_T, float("-inf")
             )
         if start_m + BLOCK_M > N_CTX or start_n_idx + BLOCK_N > N_CTX:
-            logits = tl.where(mask_m[:, None] & mask_n[None, :], logits, float("-inf"))
+            qk_T = tl.where(mask_n[:, None] & mask_m[None, :], qk_T, float("-inf"))
 
-        p = tl.math.exp(logits)
+        p_T = tl.math.exp2(qk_T)
 
-        dv += tl.dot(tl.trans(p.to(V.dtype.element_ty)), do)
+        dv += tl.dot(p_T.to(V.dtype.element_ty), do)
 
-        dp = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        dp += tl.dot(do, tl.trans(v))
+        dp_T = tl.zeros([BLOCK_N, BLOCK_M], dtype=tl.float32)
+        dp_T += tl.dot(v, tl.trans(do))
 
-        S_unscaled = p * dp
-        S_scaled = S_unscaled * (2.0 * sm_scale)
-        S_scaled_f16 = S_scaled.to(Q.dtype.element_ty)
-
-        S_colsum_acc += tl.sum(S_scaled_f16.to(tl.float32), axis=0)
-        dk_dot += tl.dot(tl.trans(S_scaled_f16), q)
+        dp_T *= p_T
+        S_colsum_acc += tl.sum(dp_T, axis=1)
+        dk_dot += tl.dot(dp_T.to(Q.dtype.element_ty), q)
 
         q_ptrs += BLOCK_M * stride_qm
-        do_ptrs += BLOCK_M * stride_qm
-        q_sq_ptrs += BLOCK_M
+        do_ptrs += BLOCK_M * stride_dom
 
-    dk_dot_f16 = dk_dot.to(K.dtype.element_ty).to(tl.float32)
-    S_colsum_f16 = S_colsum_acc.to(K.dtype.element_ty).to(tl.float32)
+    if BLOCK_DMODEL == D_HEAD:
+        k_orig = tl.load(k_ptrs, mask=mask_n[:, None], other=0.0)
+    else:
+        k_orig = tl.load(
+            k_ptrs, mask=mask_n[:, None] & (offs_d[None, :] < D_HEAD), other=0.0
+        )
 
-    dk = dk_dot_f16 - S_colsum_f16[:, None] * k_f32
+    dk = (dk_dot - S_colsum_acc[:, None] * k_orig.to(tl.float32)) * (2.0 * sm_scale)
 
     dk_ptrs = (
         DK
-        + off_z * stride_kz
-        + off_h * stride_kh
-        + offs_n[:, None] * stride_kn
+        + off_z * stride_dkz
+        + off_h * stride_dkh
+        + offs_n[:, None] * stride_dkn
         + offs_d[None, :]
     )
     dv_ptrs = (
         DV
-        + off_z * stride_vz
-        + off_h * stride_vh
-        + offs_n[:, None] * stride_vn
+        + off_z * stride_dvz
+        + off_h * stride_dvh
+        + offs_n[:, None] * stride_dvn
         + offs_d[None, :]
     )
 
@@ -1413,14 +1184,12 @@ def _rbf_non_softmax_bwd_dk_dv_kernel(
         )
 
 
-@triton.autotune(configs=_get_autotune_configs(), key=["N_CTX"])
+@triton.autotune(configs=_get_bwd_autotune_configs(), key=["N_CTX"])
 @triton.jit
 def _rbf_non_softmax_bwd_dq_kernel(
     Q,
     K,
     V,
-    Q_sq,
-    K_sq,
     sm_scale,
     DO,
     DQ,
@@ -1433,10 +1202,12 @@ def _rbf_non_softmax_bwd_dq_kernel(
     stride_vz,
     stride_vh,
     stride_vn,
-    stride_qsqz,
-    stride_qsqh,
-    stride_ksqz,
-    stride_ksqh,
+    stride_doz,
+    stride_doh,
+    stride_dom,
+    stride_dqz,
+    stride_dqh,
+    stride_dqm,
     Z,
     H,
     N_CTX,
@@ -1446,7 +1217,13 @@ def _rbf_non_softmax_bwd_dq_kernel(
     IS_CAUSAL: tl.constexpr,
     D_HEAD: tl.constexpr,
 ):
-    start_m = tl.program_id(0)
+    start_m_linear = tl.program_id(0)
+    start_m = (
+        ((N_CTX + BLOCK_M - 1) // BLOCK_M) - 1 - start_m_linear
+        if IS_CAUSAL
+        else start_m_linear
+    )
+
     off_hz = tl.program_id(1)
     off_z = off_hz // H
     off_h = off_hz % H
@@ -1465,12 +1242,11 @@ def _rbf_non_softmax_bwd_dq_kernel(
     )
     do_ptrs = (
         DO
-        + off_z * stride_qz
-        + off_h * stride_qh
-        + offs_m[:, None] * stride_qm
+        + off_z * stride_doz
+        + off_h * stride_doh
+        + offs_m[:, None] * stride_dom
         + offs_d[None, :]
     )
-    q_sq_ptrs = Q_sq + off_z * stride_qsqz + off_h * stride_qsqh + offs_m
 
     mask_m = offs_m < N_CTX
     if BLOCK_DMODEL == D_HEAD:
@@ -1484,8 +1260,10 @@ def _rbf_non_softmax_bwd_dq_kernel(
             do_ptrs, mask=mask_m[:, None] & (offs_d[None, :] < D_HEAD), other=0.0
         )
 
-    q_sq_scaled = tl.load(q_sq_ptrs, mask=mask_m, other=0.0)
-    q_f32 = q.to(tl.float32)
+    LOG2_E = 1.4426950408889634
+    sm_scale_log2 = sm_scale * LOG2_E
+    q_sq_log2 = tl.sum(q.to(tl.float32) * q.to(tl.float32), axis=1) * sm_scale_log2
+    q = (q * (2.0 * sm_scale_log2)).to(q.dtype)
 
     dq_dot_unscaled = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
     S_rowsum_acc = tl.zeros([BLOCK_M], dtype=tl.float32)
@@ -1506,7 +1284,6 @@ def _rbf_non_softmax_bwd_dq_kernel(
         + offs_n[:, None] * stride_vn
         + offs_d[None, :]
     )
-    k_sq_ptrs = K_sq + off_z * stride_ksqz + off_h * stride_ksqh + offs_n
 
     for start_n in range(0, hi, BLOCK_N):
         curr_offs_n = start_n + offs_n
@@ -1523,48 +1300,48 @@ def _rbf_non_softmax_bwd_dq_kernel(
                 v_ptrs, mask=mask_n[:, None] & (offs_d[None, :] < D_HEAD), other=0.0
             )
 
-        k_sq_scaled = tl.load(k_sq_ptrs, mask=mask_n, other=0.0)
+        k_sq_log2 = tl.sum(k.to(tl.float32) * k.to(tl.float32), axis=1) * sm_scale_log2
 
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         qk += tl.dot(q, tl.trans(k))
 
-        logits = qk * (2.0 * sm_scale) - q_sq_scaled[:, None] - k_sq_scaled[None, :]
+        qk -= q_sq_log2[:, None]
+        qk -= k_sq_log2[None, :]
 
         if IS_CAUSAL and start_m_idx < start_n + BLOCK_N:
-            logits = tl.where(
-                offs_m[:, None] >= curr_offs_n[None, :], logits, float("-inf")
-            )
+            qk = tl.where(offs_m[:, None] >= curr_offs_n[None, :], qk, float("-inf"))
         if start_m_idx + BLOCK_M > N_CTX or start_n + BLOCK_N > N_CTX:
-            logits = tl.where(mask_m[:, None] & mask_n[None, :], logits, float("-inf"))
+            qk = tl.where(mask_m[:, None] & mask_n[None, :], qk, float("-inf"))
 
-        p = tl.math.exp(logits)
+        p = tl.math.exp2(qk)
         dp = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         dp += tl.dot(do, tl.trans(v))
 
-        S_unscaled = p * dp
-        S_scaled = S_unscaled * (2.0 * sm_scale)
-        S_scaled_f16 = S_scaled.to(Q.dtype.element_ty)
-
-        S_rowsum_acc += tl.sum(S_scaled_f16.to(tl.float32), axis=1)
-        dq_dot_unscaled += tl.dot(S_scaled_f16, k)
+        dp *= p
+        S_rowsum_acc += tl.sum(dp, axis=1)
+        dq_dot_unscaled += tl.dot(dp.to(Q.dtype.element_ty), k)
 
         k_ptrs += BLOCK_N * stride_kn
         v_ptrs += BLOCK_N * stride_vn
-        k_sq_ptrs += BLOCK_N
 
-    dq_dot_f16 = dq_dot_unscaled.to(Q.dtype.element_ty).to(tl.float32)
-    S_rowsum_f16 = S_rowsum_acc.to(Q.dtype.element_ty).to(tl.float32)
+    if BLOCK_DMODEL == D_HEAD:
+        q_orig = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
+    else:
+        q_orig = tl.load(
+            q_ptrs, mask=mask_m[:, None] & (offs_d[None, :] < D_HEAD), other=0.0
+        )
 
-    dq = dq_dot_f16 - S_rowsum_f16[:, None] * q_f32
+    dq = (dq_dot_unscaled - S_rowsum_acc[:, None] * q_orig.to(tl.float32)) * (
+        2.0 * sm_scale
+    )
 
     dq_ptrs = (
         DQ
-        + off_z * stride_qz
-        + off_h * stride_qh
-        + offs_m[:, None] * stride_qm
+        + off_z * stride_dqz
+        + off_h * stride_dqh
+        + offs_m[:, None] * stride_dqm
         + offs_d[None, :]
     )
-
     if BLOCK_DMODEL == D_HEAD:
         tl.store(dq_ptrs, dq.to(DQ.dtype.element_ty), mask=mask_m[:, None])
     else:
@@ -1575,61 +1352,21 @@ def _rbf_non_softmax_bwd_dq_kernel(
         )
 
 
-@torch.library.custom_op("rbf_attn::non_softmax_fwd", mutates_args=())
+@torch.library.custom_op("rbf_attn_v5::non_softmax_fwd", mutates_args=())
 def rbf_non_softmax_fwd(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, is_causal: bool
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+) -> torch.Tensor:
     B, H, N_CTX, D_HEAD = q.shape
-    out = torch.empty_like(q)
+    out = torch.empty_like(q, memory_format=torch.contiguous_format)
 
     sm_scale = 1.0 / math.sqrt(D_HEAD)
     BLOCK_DMODEL = max(16, triton.next_power_of_2(D_HEAD))
-
-    q_sq_scaled = q.new_empty((B, H, N_CTX), dtype=torch.float32)
-    k_sq_scaled = k.new_empty((B, H, N_CTX), dtype=torch.float32)
-
-    grid_sq = (triton.cdiv(N_CTX, 128), B * H, 1)
-    _sq_norm_kernel[grid_sq](
-        q,
-        q_sq_scaled,
-        sm_scale,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        q_sq_scaled.stride(0),
-        q_sq_scaled.stride(1),
-        B,
-        H,
-        N_CTX,
-        D_HEAD=D_HEAD,
-        BLOCK_DMODEL=BLOCK_DMODEL,
-        BLOCK_N=128,
-    )
-    _sq_norm_kernel[grid_sq](
-        k,
-        k_sq_scaled,
-        sm_scale,
-        k.stride(0),
-        k.stride(1),
-        k.stride(2),
-        k_sq_scaled.stride(0),
-        k_sq_scaled.stride(1),
-        B,
-        H,
-        N_CTX,
-        D_HEAD=D_HEAD,
-        BLOCK_DMODEL=BLOCK_DMODEL,
-        BLOCK_N=128,
-    )
 
     grid = lambda meta: (triton.cdiv(N_CTX, meta["BLOCK_M"]), B * H, 1)  # noqa: E731
     _rbf_non_softmax_fwd_kernel[grid](
         q,
         k,
         v,
-        q_sq_scaled,
-        k_sq_scaled,
         sm_scale,
         out,
         q.stride(0),
@@ -1641,10 +1378,6 @@ def rbf_non_softmax_fwd(
         v.stride(0),
         v.stride(1),
         v.stride(2),
-        q_sq_scaled.stride(0),
-        q_sq_scaled.stride(1),
-        k_sq_scaled.stride(0),
-        k_sq_scaled.stride(1),
         out.stride(0),
         out.stride(1),
         out.stride(2),
@@ -1655,31 +1388,23 @@ def rbf_non_softmax_fwd(
         IS_CAUSAL=is_causal,
         D_HEAD=D_HEAD,
     )
-    return out, q_sq_scaled, k_sq_scaled
+    return out
 
 
 @rbf_non_softmax_fwd.register_fake
 def _(q, k, v, is_causal):
-    B, H, N_CTX, D_HEAD = q.shape
-    return (
-        torch.empty_like(q),
-        q.new_empty((B, H, N_CTX), dtype=torch.float32),
-        k.new_empty((B, H, N_CTX), dtype=torch.float32),
-    )
+    return torch.empty_like(q, memory_format=torch.contiguous_format)
 
 
-@torch.library.custom_op("rbf_attn::non_softmax_bwd", mutates_args=())
+@torch.library.custom_op("rbf_attn_v5::non_softmax_bwd", mutates_args=())
 def rbf_non_softmax_bwd(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    q_sq_scaled: torch.Tensor,
-    k_sq_scaled: torch.Tensor,
     dout: torch.Tensor,
     is_causal: bool,
     sm_scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    dout = dout.contiguous()
     B, H, N_CTX, D_HEAD = q.shape
 
     BLOCK_DMODEL = max(16, triton.next_power_of_2(D_HEAD))
@@ -1692,8 +1417,6 @@ def rbf_non_softmax_bwd(
         q,
         k,
         v,
-        q_sq_scaled,
-        k_sq_scaled,
         sm_scale,
         dout,
         dk,
@@ -1707,10 +1430,15 @@ def rbf_non_softmax_bwd(
         v.stride(0),
         v.stride(1),
         v.stride(2),
-        q_sq_scaled.stride(0),
-        q_sq_scaled.stride(1),
-        k_sq_scaled.stride(0),
-        k_sq_scaled.stride(1),
+        dout.stride(0),
+        dout.stride(1),
+        dout.stride(2),
+        dk.stride(0),
+        dk.stride(1),
+        dk.stride(2),
+        dv.stride(0),
+        dv.stride(1),
+        dv.stride(2),
         B,
         H,
         N_CTX,
@@ -1724,8 +1452,6 @@ def rbf_non_softmax_bwd(
         q,
         k,
         v,
-        q_sq_scaled,
-        k_sq_scaled,
         sm_scale,
         dout,
         dq,
@@ -1738,10 +1464,12 @@ def rbf_non_softmax_bwd(
         v.stride(0),
         v.stride(1),
         v.stride(2),
-        q_sq_scaled.stride(0),
-        q_sq_scaled.stride(1),
-        k_sq_scaled.stride(0),
-        k_sq_scaled.stride(1),
+        dout.stride(0),
+        dout.stride(1),
+        dout.stride(2),
+        dq.stride(0),
+        dq.stride(1),
+        dq.stride(2),
         B,
         H,
         N_CTX,
@@ -1753,28 +1481,31 @@ def rbf_non_softmax_bwd(
 
 
 @rbf_non_softmax_bwd.register_fake
-def _(q, k, v, q_sq_scaled, k_sq_scaled, dout, is_causal, sm_scale):
-    return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+def _(q, k, v, dout, is_causal, sm_scale):
+    return (
+        torch.empty_like(q, memory_format=torch.contiguous_format),
+        torch.empty_like(k, memory_format=torch.contiguous_format),
+        torch.empty_like(v, memory_format=torch.contiguous_format),
+    )
 
 
 def rbf_non_softmax_setup_context(ctx, inputs, output):
     q, k, v, is_causal = inputs
-    out, q_sq_scaled, k_sq_scaled = output
-    ctx.save_for_backward(q, k, v, q_sq_scaled, k_sq_scaled)
+    ctx.save_for_backward(q, k, v)
     ctx.is_causal = is_causal
     ctx.sm_scale = 1.0 / math.sqrt(q.shape[-1])
 
 
-def rbf_non_softmax_backward(ctx, dout, dq_sq, dk_sq):
-    q, k, v, q_sq_scaled, k_sq_scaled = ctx.saved_tensors
-    dq, dk, dv = torch.ops.rbf_attn.non_softmax_bwd(
-        q, k, v, q_sq_scaled, k_sq_scaled, dout, ctx.is_causal, ctx.sm_scale
+def rbf_non_softmax_backward(ctx, dout):
+    q, k, v = ctx.saved_tensors
+    dq, dk, dv = torch.ops.rbf_attn_v5.non_softmax_bwd(
+        q, k, v, dout, ctx.is_causal, ctx.sm_scale
     )
     return dq, dk, dv, None
 
 
 torch.library.register_autograd(
-    "rbf_attn::non_softmax_fwd",
+    "rbf_attn_v5::non_softmax_fwd",
     rbf_non_softmax_backward,
     setup_context=rbf_non_softmax_setup_context,
 )
@@ -1860,8 +1591,9 @@ def rbf_flex_attention(q, k, v, is_causal=True):
     b, h, s, d = q.shape
     sm_scale = 1.0 / (d**0.5)
 
-    k_sq_scaled = (torch.sum(k * k, dim=-1, dtype=torch.float32) * sm_scale).to(k.dtype)
-    torch._dynamo.graph_break()
+    k_sq_scaled = torch.sum(k * k, dim=-1, dtype=torch.float32) * sm_scale
+
+    torch._dynamo.graph_break()  # graph break necessary due to compiler bug :(
 
     def rbf_score_mod(score, b, h, q_idx, k_idx):
         return (2.0 * score) - k_sq_scaled[b, h, k_idx]
@@ -1933,28 +1665,24 @@ class CustomCausalAttention(nn.Module):
             k = F.rms_norm(k, (self.head_dim,))
 
         if self.positional_encoding_type == "susie":
-            pos_weight = self.pos_weight.to(q.dtype)  # [1, H, 1, D/2]
+            weight = torch.cat([self.pos_weight, self.pos_weight], dim=-1).to(q.dtype)
 
             if self.num_registers > 0:
                 text_len = s - self.num_registers
-                pos_emb_seq = self.susie_cache[:text_len].to(
-                    device=q.device, dtype=q.dtype
-                )
-
-                # BUG FIX: Replaced .repeat() with highly efficient broadcasting, but swapped .view() for .reshape()
-                # because expanding axes natively via broadcasting can disrupt contiguous memory layouts.
-                pos_emb_seq = pos_emb_seq.view(1, 1, text_len, 2, self.pos_dim // 2)
-                pos_emb_seq = (pos_emb_seq * pos_weight.unsqueeze(-2)).reshape(
-                    1, self.num_heads, text_len, self.pos_dim
+                pos_emb_seq = (
+                    self.susie_cache[:text_len]
+                    .view(1, 1, text_len, self.pos_dim)
+                    .to(device=q.device, dtype=q.dtype)
+                    * weight
                 )
                 pos_emb_reg = self.reg_pos_emb.to(q.dtype)
                 pos_emb = torch.cat([pos_emb_reg, pos_emb_seq], dim=2)
             else:
-                pos_emb = self.susie_cache[:s].to(device=q.device, dtype=q.dtype)
-
-                pos_emb = pos_emb.view(1, 1, s, 2, self.pos_dim // 2)
-                pos_emb = (pos_emb * pos_weight.unsqueeze(-2)).reshape(
-                    1, self.num_heads, s, self.pos_dim
+                pos_emb = (
+                    self.susie_cache[:s]
+                    .view(1, 1, s, self.pos_dim)
+                    .to(device=q.device, dtype=q.dtype)
+                    * weight
                 )
 
             q, k = q + pos_emb, k + pos_emb
@@ -2088,36 +1816,24 @@ def profile_memory(func, *args, **kwargs):
     return peak_mb
 
 
-def run_attention_benchmarks():
+def run_attention_benchmarks(method_names):
     print(f"Benchmarking on: {torch.cuda.get_device_name(0)}")
     print(
         f"{'Seq Len':<10} | {'Method':<25} | {'Fwd (ms)':<10} | {'Bwd (ms)':<10} | {'Peak VRAM (MB)':<15}"
     )
     print("-" * 80)
-
-    method_names = [
-        "SDPA Baseline",
-        "SDPA QK-Norm",
-        "Naive RBF Math",
-        "RBF Triton",
-        "RBF Flex-Attention",
-    ]
     results = {name: {"fwd": [], "bwd": [], "mem": []} for name in method_names}
 
     for seq_len in SEQ_LENS:
-        compiled_sdpa = torch.compile(run_sdpa)
-        compiled_sdpa_qk_norm = torch.compile(run_sdpa_qk_norm)
-        compiled_naive = torch.compile(rbf_math_forward)
-        compiled_flex = torch.compile(rbf_flex_attention)
-        compiled_triton = torch.compile(run_triton_rbf_bench)
+        compiled_methods = {
+            "SDPA Baseline": torch.compile(run_sdpa),
+            "SDPA QK-Norm": torch.compile(run_sdpa_qk_norm),
+            "Naive RBF Math": torch.compile(rbf_math_forward),
+            "RBF Triton": torch.compile(run_triton_rbf_bench),
+            "RBF Flex-Attention": torch.compile(rbf_flex_attention),
+        }
 
-        methods = [
-            ("SDPA Baseline", compiled_sdpa),
-            ("SDPA QK-Norm", compiled_sdpa_qk_norm),
-            ("Naive RBF Math", compiled_naive),
-            ("RBF Triton", compiled_triton),
-            ("RBF Flex-Attention", compiled_flex),
-        ]
+        methods = [(name, compiled_methods[name]) for name in method_names]
 
         q = torch.randn(
             BATCH_SIZE,
@@ -2220,15 +1936,15 @@ def plot_attention_results(results, filename="attention_profiling_results.png"):
     print(f"\nSaved benchmark plots to '{filepath}'")
 
 
-def run_layer_benchmarks():
+def run_layer_benchmarks(test_configs):
     print(f"Benchmarking Layers on: {torch.cuda.get_device_name(0)}")
     print(
         f"{'Seq Len':<10} | {'Method':<38} | {'Fwd (ms)':<10} | {'Bwd (ms)':<10} | {'Peak VRAM (MB)':<15}"
     )
     print("-" * 95)
 
-    configs = [
-        (
+    base_configs = {
+        "SDPA + RoPE": (
             "SDPA + RoPE",
             {
                 "attention_type": "standard",
@@ -2237,7 +1953,7 @@ def run_layer_benchmarks():
                 "apply_xsa": False,
             },
         ),
-        (
+        "SDPA + RoPE + QK-Norm": (
             "SDPA + RoPE + QK-Norm",
             {
                 "attention_type": "standard",
@@ -2246,7 +1962,7 @@ def run_layer_benchmarks():
                 "apply_xsa": False,
             },
         ),
-        (
+        "SDPA + RoPE + QK-Norm + XSA": (
             "SDPA + RoPE + QK-Norm + XSA",
             {
                 "attention_type": "standard",
@@ -2255,25 +1971,25 @@ def run_layer_benchmarks():
                 "apply_xsa": True,
             },
         ),
-        # (
-        #     "RBF Flex + SuSiE",
-        #     {
-        #         "attention_type": "rbf_flex",
-        #         "use_rope": True,
-        #         "use_qk_norm": False,
-        #         "apply_xsa": False,
-        #     },
-        # ),
-        # (
-        #     "RBF Flex + SuSiE + XSA",
-        #     {
-        #         "attention_type": "rbf_flex",
-        #         "use_rope": True,
-        #         "use_qk_norm": False,
-        #         "apply_xsa": True,
-        #     },
-        # ),
-        (
+        "RBF Flex + SuSiE": (
+            "RBF Flex + SuSiE",
+            {
+                "attention_type": "rbf_flex",
+                "use_rope": True,
+                "use_qk_norm": False,
+                "apply_xsa": False,
+            },
+        ),
+        "RBF Flex + SuSiE + XSA": (
+            "RBF Flex + SuSiE + XSA",
+            {
+                "attention_type": "rbf_flex",
+                "use_rope": True,
+                "use_qk_norm": False,
+                "apply_xsa": True,
+            },
+        ),
+        "RBF Triton + SuSiE": (
             "RBF Triton + SuSiE",
             {
                 "attention_type": "rbf_triton",
@@ -2282,7 +1998,7 @@ def run_layer_benchmarks():
                 "apply_xsa": False,
             },
         ),
-        (
+        "RBF Triton + SuSiE + XSA": (
             "RBF Triton + SuSiE + XSA",
             {
                 "attention_type": "rbf_triton",
@@ -2291,7 +2007,9 @@ def run_layer_benchmarks():
                 "apply_xsa": True,
             },
         ),
-    ]
+    }
+
+    configs = [base_configs[name] for name in test_configs]
 
     results = {name: {"fwd": [], "bwd": [], "mem": []} for name, _ in configs}
     emb_dims = NUM_HEADS * HEAD_DIM
@@ -2401,14 +2119,31 @@ if __name__ == "__main__":
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
+    attention_methods = [
+        "SDPA Baseline",
+        "SDPA QK-Norm",
+        # "Naive RBF Math",
+        "RBF Triton",
+        # "RBF Flex-Attention",
+    ]
+
     print("Pre-computing Flex-Attention block masks...")
     for seq_len in SEQ_LENS:
         get_causal_mask_flex(seq_len, DEVICE)
 
     # run attention benchmarks
-    attention_results = run_attention_benchmarks()
+    attention_results = run_attention_benchmarks(attention_methods)
     plot_attention_results(attention_results)
 
     # run layer benchmnarks
-    layer_results = run_layer_benchmarks()
+    test_configs = [
+        # "SDPA + RoPE",
+        "SDPA + RoPE + QK-Norm",
+        # "SDPA + RoPE + QK-Norm + XSA",
+        # "RBF Flex + SuSiE",
+        # "RBF Flex + SuSiE + XSA",
+        "RBF Triton + SuSiE",
+        # "RBF Triton + SuSiE + XSA",
+    ]
+    layer_results = run_layer_benchmarks(test_configs)
     plot_layer_results(layer_results)

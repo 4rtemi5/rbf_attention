@@ -312,7 +312,7 @@ def train_variant(
 
     config_dict = config.to_dict()
     config_dict["model_type"] = model_type
-    with wandb.init(project="fun_attention", config=config.to_dict()) as run:
+    with wandb.init(project="rbf_attention", config=config.to_dict()) as run:
         run.watch(model, criterion=criterion, log="all", log_freq=config.log_steps)
 
         t0 = time.time()
